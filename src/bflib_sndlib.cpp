@@ -960,6 +960,47 @@ extern "C" void StopAllSamples() {
 	}
 }
 
+extern "C" void FollowDefaultAudioDevice(void) {
+	// The device opened as the system default stays on that output even when
+	// Windows switches its default later, as it does when a VR headset's
+	// audio (Virtual Desktop, Link) connects. ALC_SOFT_reopen_device moves it
+	// across without disturbing playing sources.
+	if (!g_openal_device) {
+		return;
+	}
+	if (!alcIsExtensionPresent(g_openal_device.get(), "ALC_SOFT_reopen_device")) {
+		static bool warned = false;
+		if (!warned) {
+			WARNLOG("OpenAL has no ALC_SOFT_reopen_device; sound stays on its first output");
+			warned = true;
+		}
+		return;
+	}
+	const bool enum_all = alcIsExtensionPresent(nullptr, "ALC_ENUMERATE_ALL_EXT");
+	// OpenAL Soft only refreshes its idea of the default device when the
+	// device list is probed, which asking for the list does.
+	alcGetString(nullptr, enum_all ? ALC_ALL_DEVICES_SPECIFIER : ALC_DEVICE_SPECIFIER);
+	const ALCchar * wanted = alcGetString(nullptr, enum_all ? ALC_DEFAULT_ALL_DEVICES_SPECIFIER : ALC_DEFAULT_DEVICE_SPECIFIER);
+	if (wanted == nullptr || wanted[0] == 0) {
+		return;
+	}
+	const std::string target(wanted);  // copied: the next alcGetString() may reuse the buffer
+	const ALCchar * current = alcGetString(g_openal_device.get(), enum_all ? ALC_ALL_DEVICES_SPECIFIER : ALC_DEVICE_SPECIFIER);
+	if (current == nullptr || target == current) {
+		return;
+	}
+	typedef ALCboolean (ALC_APIENTRY *ReopenDeviceFn)(ALCdevice *, const ALCchar *, const ALCint *);
+	const auto reopen = reinterpret_cast<ReopenDeviceFn>(alcGetProcAddress(g_openal_device.get(), "alcReopenDeviceSOFT"));
+	if (reopen == nullptr) {
+		return;
+	}
+	if (reopen(g_openal_device.get(), nullptr, nullptr)) {
+		LbJustLog("Sound output moved to the new default device: %s\n", target.c_str());
+	} else {
+		WARNLOG("Could not move sound output to %s", target.c_str());
+	}
+}
+
 extern "C" TbBool InitAudio(const SoundSettings * settings) {
 	try {
 		if (start_params.easter_egg == true) {

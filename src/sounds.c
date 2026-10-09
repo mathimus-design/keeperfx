@@ -29,6 +29,7 @@
 #include "engine_render.h"
 #include "map_utils.h"
 #include "engine_camera.h"
+#include "kfx/vr/VR.h"
 #include "local_camera.h"
 #include "gui_soundmsgs.h"
 #include "gui_topmsg.h"
@@ -296,6 +297,16 @@ TbBool update_3d_sound_receiver(struct PlayerInfo* player)
         S3DSetSoundReceiverSensitivity(LbLerp(2, 64, rescale_audio));
     } else {
         S3DSetMaximumSoundDistance(5120);
+        S3DSetSoundReceiverSensitivity(64);
+    }
+    // VR tabletop: hear what the headset looks at, not the desktop camera.
+    int vr_x, vr_y, vr_z, vr_angle;
+    if ((cam->view_mode == PVM_IsoWibbleView || cam->view_mode == PVM_FrontView || cam->view_mode == PVM_IsoStraightView)
+        && VR_GetSoundListener(&vr_x, &vr_y, &vr_z, &vr_angle))
+    {
+        S3DSetSoundReceiverPosition(vr_x, vr_y, vr_z);
+        S3DSetSoundReceiverOrientation(vr_angle, 0, 0);
+        S3DSetMaximumSoundDistance(14000);
         S3DSetSoundReceiverSensitivity(64);
     }
     return true;

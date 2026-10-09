@@ -31,6 +31,7 @@
 #include "kfx/renderer/RenderGraph.h"
 #include "kfx/renderer/RendererManager.h"
 #include "kfx/profiling/KfxProfiling.h"
+#include "kfx/vr/VRSystem.h"
 #include "engine_textures.h" // block_ptrs[] -- tile atlas build-ready check
 #include "vidmode.h" // pixmap.fade_tables
 #include "front_simple.h" // engine_palette
@@ -500,7 +501,14 @@ void RendererOpenGL::render_thread_work()
         m_impl->PresentScreenTarget(fd);
     }
 
-    const int want_interval = vsync_enabled ? 1 : 0;
+    {
+        KFX_ZONE_COLOR("VR::RenderThreadFrame", KFX_COLOR_RENDER_GPU);
+        VR::RenderThreadFrame(m_impl->world, m_impl->resource_mapper.GetScreenFramebuffer(), fd.screen_w, fd.screen_h);
+    }
+
+    // While a headset session runs, its frame timing paces this thread; desktop
+    // vsync on top of that would halve the headset's frame rate.
+    const int want_interval = (vsync_enabled && !VR::IsSessionRunning()) ? 1 : 0;
     if (want_interval != m_impl->swap_interval)
     {
         m_gl_context->SetSwapInterval(want_interval);
@@ -680,6 +688,7 @@ void RendererOpenGL::render_thread_cleanup()
 {
     if (m_impl->functions_loaded)
     {
+        VR::RenderThreadShutdown();
         m_impl->resource_mapper.ShutdownAll();
         m_impl->ui.Shutdown();
         m_impl->atlas.Free();
@@ -760,6 +769,7 @@ void RendererOpenGL::PresentFrame()
 
     
     m_impl->world.FlipBuffers();
+    VR::GameThreadSync();  // render thread is idle here, safe to hand over map data
     m_impl->mapfade.FlipBuffers();
     m_impl->imgpresent.FlipBuffers();
     m_impl->zoomboxtiles.FlipBuffers();

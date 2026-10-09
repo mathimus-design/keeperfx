@@ -143,6 +143,7 @@
 #include "room_library.h"
 #include <cstdint>
 #include "timer.h"
+#include "kfx/vr/VR.h"
 
 #ifdef FUNCTESTING
   #include "ftests/ftest.h"
@@ -1709,6 +1710,13 @@ static short process_command_line(unsigned short argc, char *argv[])
       } else
       if (strcasecmp(parstr, "opengl") == 0)
       {
+        start_params.overrides[Clo_Renderer] = true;
+        start_params.renderer_type = RENDERER_OPENGL;
+      } else
+      if (strcasecmp(parstr, "vr") == 0)
+      {
+        // VR tabletop needs the OpenGL renderer.
+        vr_requested = 1;
         start_params.overrides[Clo_Renderer] = true;
         start_params.renderer_type = RENDERER_OPENGL;
       } else

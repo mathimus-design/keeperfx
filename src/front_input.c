@@ -82,6 +82,7 @@
 #include "keeperfx.hpp"
 
 #include <math.h>
+#include "kfx/vr/VR.h"
 #include "post_inc.h"
 
 #ifdef __cplusplus
@@ -2368,7 +2369,9 @@ static void get_isometric_or_front_view_mouse_inputs(struct Packet *pckt,int rot
     {
         return; // don't pan the camera if the mouse has left the window
     }
-    if (is_feature_on(Ft_DisableCursorCameraPanning) == false)
+    // While the headset shows the dungeon, VR moves the cursor (e.g. onto the
+    // side panel at the screen edge), which must not pan the desktop camera.
+    if ((is_feature_on(Ft_DisableCursorCameraPanning) == false) && !VR_IsHeadsetActive())
     {
         long mx = my_mouse_x;
         long my = my_mouse_y;

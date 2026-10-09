@@ -117,6 +117,13 @@ if(WIN32)
     # i686-w64-mingw32-g++ toolchain.
     if(VCPKG_TOOLCHAIN)
         find_package(OpenAL CONFIG REQUIRED)
+        # VR support (OpenXR). Only the headers are used: the game loads the active
+        # runtime itself (kfx/vr/VRSystem.cpp), as the MinGW build of the
+        # loader DLL exports no functions.
+        find_package(OpenXR CONFIG)
+        if(OpenXR_FOUND)
+            kfx_status("VR" "OpenXR headers found -- VR support enabled (-vr)")
+        endif()
     else()
         kfx_fetch(openal "${KFX_DEPS_BASE}/2024-11-14/openal-mingw32.tar.gz")
         kfx_imported(openal_static "${D}/openal/libOpenAL32.a" "${D}/openal/include")
@@ -247,6 +254,10 @@ function(kfx_link_dependencies TARGET)
         target_link_libraries(${TARGET} PRIVATE kfx_sdl3 ${_static_link} centitoml)
         if(VCPKG_TOOLCHAIN)
             target_link_libraries(${TARGET} PRIVATE OpenAL::OpenAL)
+        endif()
+        if(OpenXR_FOUND)
+            target_link_libraries(${TARGET} PRIVATE OpenXR::headers advapi32)
+            target_compile_definitions(${TARGET} PRIVATE KFX_VR=1)
         endif()
     else()
         target_link_libraries(${TARGET} PRIVATE

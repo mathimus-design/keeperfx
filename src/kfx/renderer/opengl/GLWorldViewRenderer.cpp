@@ -58,6 +58,23 @@ GLuint GLWorldViewRenderer::ResolveShaderId(GpuResourceHandle handle) const
     return prog ? prog->id : 0;
 }
 
+GLWorldViewRenderer::VRTextures GLWorldViewRenderer::GetVRTextures() const
+{
+    VRTextures t = {};
+    if (!m_resource_mapper)
+        return t;
+    if (m_atlas && m_atlas->IsInitialized())
+    {
+        const GLTexture* atlas = m_resource_mapper->ResolveTexture(m_atlas->GetAtlasTextureArray());
+        t.atlas = atlas ? atlas->id : 0;
+    }
+    t.palette = ResolvePaletteTexId();
+    t.fade = (m_fade_tex_handle != kInvalidGpuResource) ? ResolveFadeTexId() : 0;
+    const GLTexture* lightmap = m_resource_mapper->ResolveTexture(m_lightmap_tex_handle);
+    t.lightmap = lightmap ? lightmap->id : 0;
+    return t;
+}
+
 
 /** Max dimension of a keeper-sprite decode buffer (stride for GL_UNPACK_ROW_LENGTH). */
 static constexpr int k_kspr_decode_dim = 256;

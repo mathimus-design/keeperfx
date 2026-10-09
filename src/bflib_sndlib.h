@@ -39,6 +39,8 @@ void MonitorStreamedSoundTrack(void);
 void * GetSoundDriver(void);
 void StopAllSamples(void);
 TbBool InitAudio(const struct SoundSettings *);
+/** Moves sound effects to the system's current default output if it changed. */
+void FollowDefaultAudioDevice(void);
 TbBool IsSamplePlaying(SoundMilesID);
 SoundVolume GetCurrentSoundMasterVolume(void);
 void SetSampleVolume(SoundEmitterID, SoundSmplTblID, SoundVolume);

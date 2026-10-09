@@ -100,6 +100,16 @@ public:
     /** GPU resource handle for the 256x256 fade/lighting LUT. */
     void SetFadeTexture(GpuResourceHandle tex) { m_fade_tex_handle = tex; }
     void SetPaletteIndexTexture(GpuResourceHandle tex) { m_palette_index_tex_handle = tex; }
+
+    /** Textures WORLD_FRAGMENT_SHADER samples, for the VR pass (kfx/vr) to
+     *  bind on the same units. 0 where not available yet. Render thread. */
+    struct VRTextures {
+        GLuint atlas;     /**< unit 0, GL_TEXTURE_2D_ARRAY */
+        GLuint palette;   /**< unit 1 */
+        GLuint lightmap;  /**< unit 2, refreshed by each world draw */
+        GLuint fade;      /**< unit 3 */
+    };
+    VRTextures GetVRTextures() const;
     /** GPU resource handle for the 256x1 RGBA palette. */
     void SetPaletteTexture(GpuResourceHandle tex) { m_palette_tex_handle = tex; }
 
