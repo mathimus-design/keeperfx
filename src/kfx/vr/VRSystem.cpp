@@ -77,7 +77,7 @@ namespace {
     X(xrAttachSessionActionSets) X(xrCreateActionSpace) X(xrPollEvent) X(xrBeginSession) \
     X(xrEndSession) X(xrLocateSpace) X(xrSyncActions) X(xrGetActionStateFloat) \
     X(xrGetActionStateBoolean) X(xrGetActionStateVector2f) X(xrLocateViews) X(xrAcquireSwapchainImage) \
-    X(xrWaitSwapchainImage) X(xrReleaseSwapchainImage) X(xrWaitFrame) X(xrBeginFrame) X(xrEndFrame)
+    X(xrWaitSwapchainImage) X(xrReleaseSwapchainImage) X(xrWaitFrame) X(xrBeginFrame) X(xrEndFrame) X(xrApplyHapticFeedback)
 
 #define VR_XR_DECLARE(name) PFN_##name name = nullptr;
 PFN_xrGetInstanceProcAddr xrGetInstanceProcAddr = nullptr;
@@ -450,6 +450,8 @@ struct State {
     XrAction scroll_action = XR_NULL_HANDLE;    // left thumbstick
     float scroll_x = 0, scroll_y = 0;           // its current deflection
     XrAction turn_action = XR_NULL_HANDLE;      // right thumbstick
+    XrAction haptic_action = XR_NULL_HANDLE;    // controller vibration, per hand
+    XrAction pause_action = XR_NULL_HANDLE;     // left menu button
     float turn_x = 0;                           // its sideways deflection
     Vec3 head_forward = {0, 0, -1};             // horizontal, from the last rendered frame
     // Possession: life size, with the creature's eyes where the player's head
@@ -471,7 +473,9 @@ struct State {
     bool ray_left = false;                      // from the left hand, casting the chosen spell
     float ray_palm_sign = -1.0f;                // palm ray along the hand's -X (right) or +X (left)
     bool possess_was_chosen = false;            // Possess was chosen last frame
-    bool panel_auto_hidden = false;             // the panel folded away for Possess
+    bool panel_auto_hidden = false;             // the panel folded away by itself (a tool picked from it)
+    float panel_click_time = 0;                 // seconds since a press on the panel still counting
+    int last_work_state = 0;                    // to see the player state change
     Quat ray_rot = {0, 0, 0, 1};                // the ray hand's aim orientation
     Vec3 ray_origin = {0, 0, 0}, ray_dir = {0, 0, -1};
     XrPath hand_paths[2] = {XR_NULL_PATH, XR_NULL_PATH};
@@ -495,6 +499,17 @@ struct State {
     GLint loc_sprite_use_fade = -1, loc_sprite_alpha = -1, loc_sprite_shadow = -1, loc_sprite_one_colour = -1;
     GLuint sprite_vao = 0, sprite_vbo = 0;
     std::unordered_map<int32_t, GLuint> sprite_textures;  // sprite id -> RG8 texture
+    std::unordered_map<int32_t, std::pair<int, int>> sprite_sizes;  // sprite id -> width, height
+    // Palm menu: creature icons over the upturned left palm (stage space).
+    GLuint ui_vao = 0, ui_vbo = 0;
+    bool palm_shown = false;
+    bool palm_armed = true;                 // a tap counts again once the finger has left the icons
+    int palm_touched = -1;                  // icon under the right fingertip
+    int palm_hover = -1;                    // icon the fingertip is just in front of
+    int palm_flash = -1;                    // icon just tapped, flashing
+    float palm_flash_time = 0;              // seconds of flash left
+    float point_pose = 0;                   // 0..1: right hand easing into a pointing pose
+    Vec3 palm_right = {1, 0, 0}, palm_up = {0, 1, 0}, palm_normal = {0, 0, 1};
 
     // Wrist panel: copy of the desktop side panel, shown above the left hand.
     GLuint panel_prog = 0;
@@ -507,7 +522,45 @@ struct State {
     Vec3 panel_center = {0, 0, 0};
     Vec3 panel_right = {1, 0, 0}, panel_up = {0, 1, 0}, panel_normal = {0, 0, 1};
     float panel_world_w = 0, panel_world_h = 0;  // metres
-    Vec3 panel_pointer = {0, 0, 0};         // where the right ray meets the panel
+    Vec3 panel_pointer = {0, 0, 0};         // where the right ray (or fingertip) meets the panel
+    // Message box copy (objective / info text), beside the wrist panel.
+    GLuint info_tex = 0, info_fbo = 0;
+    int info_w = 0, info_h = 0;             // copied size in screen pixels
+    bool info_ready = false;                // copied this frame
+    bool info_shown = false;                // drawn this frame
+    bool info_hidden = false;               // hidden with the button on the panel
+    Vec3 info_center = {0, 0, 0};
+    Vec3 info_right = {1, 0, 0}, info_up = {0, 1, 0}, info_normal = {0, 0, 1};
+    float info_world_w = 0, info_world_h = 0;
+    bool info_finger = false;               // fingertip (or ray) on it
+    bool info_touching = false;
+    bool info_was_pressed = false;
+    float info_flash_time = 0;
+    Vec3 info_pointer = {0, 0, 0};
+    // New text alert: the left hand glows yellow and buzzes until the text is looked at.
+    bool text_alert = false;
+    bool text_was_visible = false;
+    int text_last_message = 0;
+    int text_alert_pulses = 0;
+    float text_alert_timer = 0;
+    // The box's own buttons (tick, eye...), repeated in a row under it.
+    struct CapturedRect { GLuint tex = 0, fbo = 0; int w = 0, h = 0; };
+    CapturedRect info_btn[6];
+    int info_btn_count = 0;                 // copied this frame
+    Vec3 info_btn_center[6];
+    float info_btn_world_w[6] = {}, info_btn_world_h[6] = {};
+    int info_btn_hover = -1;                // button the fingertip is on
+    int info_btn_flash = -1;                // button just pressed
+    // The hide / show button above the panel's top-right corner.
+    bool info_button_shown = false;
+    Vec3 info_button_center = {0, 0, 0};
+    bool info_button_armed = true;
+    bool info_button_hover = false;
+    float info_button_flash = 0;
+    bool panel_finger = false;              // the index fingertip is on the panel
+    bool panel_touching = false;            // ... and pushed into it
+    bool panel_was_pressed = false;         // last frame, to catch a new press
+    float panel_flash_time = 0;             // seconds of the press flash left
 
     // Menu screen: the whole desktop screen, floating within reach while a
     // menu is up, touched with the index finger.
@@ -523,6 +576,8 @@ struct State {
     bool menu_pointer_valid = false;        // finger or ray over the screen
     Vec3 menu_pointer = {0, 0, 0};          // where, for the marker
     bool menu_by_ray = false;               // the ray rather than the finger
+    bool menu_was_pressed = false;          // last frame's press, to catch a new one
+    float menu_flash_time = 0;              // seconds of the press flash left
 
     std::vector<Chunk> chunks;
     int chunks_x = 0, chunks_y = 0;
@@ -565,9 +620,24 @@ PanelInfo s_panel_info;
 bool s_menu_wanted = false;
 MenuInput s_menu_in;
 
+/** The message box: where it is (game -> render) and a touch on it (render -> game). */
+InfoBoxInfo s_info_box;
+MenuInput s_info_in;
+
 /** A spell is chosen and waiting to be cast, and whether it is Possess (game -> render). */
 bool s_spell_chosen = false;
 bool s_possess_chosen = false;
+/** The player's state and whether it is the plain hand (game -> render). */
+int s_work_state = 0;
+bool s_plain_hand = true;
+
+/** The pause button was pressed (render -> game), and the game thread's copy
+ *  that the input code takes once. */
+bool s_pause_request = false;
+bool s_pause_pending = false;
+
+/** Creature type to pick up from the palm menu (render -> game), 0 for none. */
+int s_palm_pick_kind = 0;
 
 /** Head position and gaze in game units (render -> game), for the sound listener. */
 struct HeadInput {
@@ -750,6 +820,18 @@ bool create_gl_resources()
     glEnableVertexAttribArray(2);
     glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, sizeof(SpriteVertex), (void*)offsetof(SpriteVertex, stl_x));
     glBindVertexArray(0);
+    // Same layout for sprites placed in the reference space (the palm menu).
+    glGenVertexArrays(1, &s.ui_vao);
+    glGenBuffers(1, &s.ui_vbo);
+    glBindVertexArray(s.ui_vao);
+    glBindBuffer(GL_ARRAY_BUFFER, s.ui_vbo);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(SpriteVertex), (void*)offsetof(SpriteVertex, x));
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, sizeof(SpriteVertex), (void*)offsetof(SpriteVertex, u));
+    glEnableVertexAttribArray(2);
+    glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, sizeof(SpriteVertex), (void*)offsetof(SpriteVertex, stl_x));
+    glBindVertexArray(0);
     glBindBuffer(GL_ARRAY_BUFFER, 0);
     s_things.reset_cache = true;  // no sprite textures yet: have the game thread send them all
     {
@@ -910,16 +992,26 @@ bool create_actions()
         !make_action(XR_ACTION_TYPE_BOOLEAN_INPUT, "hand_action", "Drop / slap (right click)", true, &s.hand_action) ||
         !make_action(XR_ACTION_TYPE_BOOLEAN_INPUT, "toggle_panel", "Show / hide the wrist panel", false, &s.panel_toggle_action) ||
         !make_action(XR_ACTION_TYPE_VECTOR2F_INPUT, "scroll", "Scroll the dungeon", false, &s.scroll_action) ||
-        !make_action(XR_ACTION_TYPE_VECTOR2F_INPUT, "turn", "Turn (possessing)", false, &s.turn_action))
+        !make_action(XR_ACTION_TYPE_VECTOR2F_INPUT, "turn", "Turn (possessing)", false, &s.turn_action) ||
+        !make_action(XR_ACTION_TYPE_VIBRATION_OUTPUT, "haptic", "Feedback buzz", true, &s.haptic_action) ||
+        !make_action(XR_ACTION_TYPE_BOOLEAN_INPUT, "pause", "Pause the game", false, &s.pause_action))
         return false;
 
     const char* const profiles[] = {
         "/interaction_profiles/oculus/touch_controller",
         "/interaction_profiles/valve/index_controller",
     };
-    for (const char* profile : profiles)
+    // Pause: the left menu button on Touch controllers; Index ones have none,
+    // so their left B. Paths differ per controller, so it is added per profile.
+    const char* const pause_paths[] = {
+        "/user/hand/left/input/menu/click",
+        "/user/hand/left/input/b/click",
+    };
+    for (size_t p = 0; p < sizeof(profiles) / sizeof(profiles[0]); p++)
     {
+        const char* const profile = profiles[p];
         const XrActionSuggestedBinding bindings[] = {
+            {s.pause_action,    to_path(pause_paths[p])},
             {s.pose_action,     to_path("/user/hand/left/input/grip/pose")},
             {s.pose_action,     to_path("/user/hand/right/input/grip/pose")},
             {s.grip_action,     to_path("/user/hand/left/input/squeeze/value")},
@@ -933,6 +1025,8 @@ bool create_actions()
             {s.panel_toggle_action, to_path("/user/hand/left/input/thumbstick/click")},
             {s.scroll_action,   to_path("/user/hand/left/input/thumbstick")},
             {s.turn_action,     to_path("/user/hand/right/input/thumbstick")},
+            {s.haptic_action,   to_path("/user/hand/left/output/haptic")},
+            {s.haptic_action,   to_path("/user/hand/right/output/haptic")},
         };
         XrInteractionProfileSuggestedBinding suggested = {XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
         suggested.interactionProfile = to_path(profile);
@@ -1068,7 +1162,7 @@ void destroy_xr()
     s.action_set = XR_NULL_HANDLE;
     s.pose_action = s.grip_action = s.recenter_action = XR_NULL_HANDLE;
     s.aim_action = s.select_action = s.hand_action = s.panel_toggle_action = XR_NULL_HANDLE;
-    s.scroll_action = s.turn_action = XR_NULL_HANDLE;
+    s.scroll_action = s.turn_action = s.haptic_action = s.pause_action = XR_NULL_HANDLE;
     s.scroll_x = s.scroll_y = s.turn_x = 0.0f;
     s.hand_spaces[0] = s.hand_spaces[1] = XR_NULL_HANDLE;
     s.aim_spaces[0] = s.aim_spaces[1] = XR_NULL_HANDLE;
@@ -1096,8 +1190,24 @@ void destroy_gl()
     s.sprite_textures.clear();
     if (s.sprite_vbo) glDeleteBuffers(1, &s.sprite_vbo);
     if (s.sprite_vao) glDeleteVertexArrays(1, &s.sprite_vao);
+    if (s.ui_vbo) glDeleteBuffers(1, &s.ui_vbo);
+    if (s.ui_vao) glDeleteVertexArrays(1, &s.ui_vao);
+    s.ui_vbo = s.ui_vao = 0;
+    s.sprite_sizes.clear();
     if (s.sprite_prog) glDeleteProgram(s.sprite_prog);
     s.sprite_vbo = s.sprite_vao = s.sprite_prog = 0;
+    for (State::CapturedRect& b : s.info_btn)
+    {
+        if (b.fbo) glDeleteFramebuffers(1, &b.fbo);
+        if (b.tex) glDeleteTextures(1, &b.tex);
+        b = State::CapturedRect();
+    }
+    s.info_btn_count = 0;
+    if (s.info_fbo) glDeleteFramebuffers(1, &s.info_fbo);
+    if (s.info_tex) glDeleteTextures(1, &s.info_tex);
+    s.info_fbo = s.info_tex = 0;
+    s.info_w = s.info_h = 0;
+    s.info_ready = false;
     if (s.menu_fbo) glDeleteFramebuffers(1, &s.menu_fbo);
     if (s.menu_tex) glDeleteTextures(1, &s.menu_tex);
     s.menu_fbo = s.menu_tex = 0;
@@ -1182,6 +1292,17 @@ bool place_panel(Vec3 head)
 }
 
 /** Ray against the wrist panel; on a hit returns the panel coordinates (0..1, v up). */
+/** Point on the wrist panel: 0..1 coordinates (v up), and the distance in
+ *  front of it (negative once pushed through). False outside its edges. */
+bool panel_coords(Vec3 p, float* u, float* v, float* depth)
+{
+    const Vec3 d = p - s.panel_center;
+    *u = (d.x * s.panel_right.x + d.y * s.panel_right.y + d.z * s.panel_right.z) / s.panel_world_w + 0.5f;
+    *v = (d.x * s.panel_up.x + d.y * s.panel_up.y + d.z * s.panel_up.z) / s.panel_world_h + 0.5f;
+    *depth = d.x * s.panel_normal.x + d.y * s.panel_normal.y + d.z * s.panel_normal.z;
+    return *u >= 0.0f && *u <= 1.0f && *v >= 0.0f && *v <= 1.0f;
+}
+
 bool ray_hits_panel(Vec3 origin, Vec3 dir, float* u, float* v, Vec3* point)
 {
     const float denom = dir.x * s.panel_normal.x + dir.y * s.panel_normal.y + dir.z * s.panel_normal.z;
@@ -1302,14 +1423,14 @@ Vec3 index_fingertip(const Hand& hand)
     Mat4 m = Mat4::FromPose(hand.aim_tracked ? hand.aim_rot : hand.rot, hand.pos)
            * Mat4::Translation({0.034f, 0.0f, 0.004f}) * Mat4::Translation({-0.002f, 0.027f, -0.042f});
     for (int j = 0; j < 3; j++)
-        m = m * Mat4::RotationY(joint_bend[j] * hand.trigger + k_rest_curl) * Mat4::Translation({0.0f, 0.0f, -segment_len[j] * 0.95f});
+        m = m * Mat4::RotationY(joint_bend[j] * hand.trigger * (1.0f - s.point_pose) + k_rest_curl) * Mat4::Translation({0.0f, 0.0f, -segment_len[j] * 0.95f});
     return { m.m[12], m.m[13], m.m[14] };
 }
 
 /** Touch handling for the menu screen. The index fingertip pressing into the
  *  screen clicks; hovering just in front moves the cursor. The forward ray
  *  with the trigger works too, for out-of-reach spots. */
-MenuInput update_menu_touch(const Hand& hand)
+MenuInput update_menu_touch_raw(const Hand& hand)
 {
     MenuInput in;
     s.menu_pointer_valid = false;
@@ -1363,6 +1484,639 @@ MenuInput update_menu_touch(const Hand& hand)
     return in;
 }
 
+void buzz(int hand, float amplitude, float seconds);
+
+/** Menu touch, plus the confirmation when a press begins: a flash on the
+ *  screen and a short buzz. */
+MenuInput update_menu_touch(const Hand& hand)
+{
+    const MenuInput in = update_menu_touch_raw(hand);
+    if (s.menu_flash_time > 0.0f)
+        s.menu_flash_time -= s.frame_dt;
+    if (in.valid && in.press && !s.menu_was_pressed)
+    {
+        s.menu_flash_time = 0.35f;
+        buzz(1, 0.6f, 0.04f);
+    }
+    s.menu_was_pressed = in.valid && in.press;
+    return in;
+}
+
+/** A short buzz in one controller (0 left, 1 right), to confirm a press. */
+void buzz(int hand, float amplitude, float seconds)
+{
+    if (s.haptic_action == XR_NULL_HANDLE || s.session == XR_NULL_HANDLE)
+        return;
+    XrHapticActionInfo info = {XR_TYPE_HAPTIC_ACTION_INFO};
+    info.action = s.haptic_action;
+    info.subactionPath = s.hand_paths[hand];
+    XrHapticVibration vibration = {XR_TYPE_HAPTIC_VIBRATION};
+    vibration.amplitude = amplitude;
+    vibration.duration = (XrDuration)(seconds * 1e9f);
+    vibration.frequency = XR_FREQUENCY_UNSPECIFIED;
+    xrApplyHapticFeedback(s.session, &info, (const XrHapticBaseHeader*)&vibration);
+}
+
+/******************************************************************************/
+// Message box: a copy of the objective / info text box the desktop shows over
+// the dungeon view, beside the wrist panel; touched like the panel. A button
+// above the panel hides or shows it.
+
+/** Copies a rectangle of the finished desktop frame (screen fractions, y from
+ *  the top) into its own texture, sized to match. */
+bool capture_rect(GLuint screen_fbo, int screen_w, int screen_h, float fx0, float fy0, float fx1, float fy1,
+                  State::CapturedRect& out)
+{
+    const int x0 = (int)(fx0 * screen_w), x1 = (int)(fx1 * screen_w);
+    const int y0 = (int)((1.0f - fy1) * screen_h), y1 = (int)((1.0f - fy0) * screen_h);
+    const int w = x1 - x0, h = y1 - y0;
+    if (w <= 0 || h <= 0)
+        return false;
+    if (out.tex == 0 || w != out.w || h != out.h)
+    {
+        if (out.tex == 0) glGenTextures(1, &out.tex);
+        if (out.fbo == 0) glGenFramebuffers(1, &out.fbo);
+        glBindTexture(GL_TEXTURE_2D, out.tex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        glBindFramebuffer(GL_FRAMEBUFFER, out.fbo);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, out.tex, 0);
+        out.w = w;
+        out.h = h;
+    }
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, screen_fbo);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, out.fbo);
+    glBlitFramebuffer(x0, y0, x1, y1, 0, 0, w, h, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+    glBindFramebuffer(GL_FRAMEBUFFER, screen_fbo);
+    return true;
+}
+
+/** Copies the message box out of the finished desktop frame into info_tex. */
+void capture_info(GLuint screen_fbo, int screen_w, int screen_h)
+{
+    s.info_ready = false;
+    s.info_btn_count = 0;
+    if (!s_info_box.visible || screen_fbo == 0 || screen_w <= 0 || screen_h <= 0)
+        return;
+    {
+        const GLboolean scissor = glIsEnabled(GL_SCISSOR_TEST);
+        glDisable(GL_SCISSOR_TEST);
+        for (int i = 0; i < s_info_box.button_count && i < 6; i++)
+        {
+            const InfoBoxInfo::Button& b = s_info_box.buttons[i];
+            if (!capture_rect(screen_fbo, screen_w, screen_h, b.x0, b.y0, b.x1, b.y1, s.info_btn[s.info_btn_count]))
+                break;  // keep the copies in step with s_info_box.buttons
+            s.info_btn_count++;
+        }
+        if (scissor)
+            glEnable(GL_SCISSOR_TEST);
+    }
+    const int x0 = (int)(s_info_box.x0 * screen_w), x1 = (int)(s_info_box.x1 * screen_w);
+    // GL rows run bottom up, the box's top down.
+    const int y0 = (int)((1.0f - s_info_box.y1) * screen_h), y1 = (int)((1.0f - s_info_box.y0) * screen_h);
+    const int w = x1 - x0, h = y1 - y0;
+    if (w <= 0 || h <= 0)
+        return;
+    if (s.info_tex == 0 || w != s.info_w || h != s.info_h)
+    {
+        if (s.info_tex == 0) glGenTextures(1, &s.info_tex);
+        if (s.info_fbo == 0) glGenFramebuffers(1, &s.info_fbo);
+        glBindTexture(GL_TEXTURE_2D, s.info_tex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        glBindFramebuffer(GL_FRAMEBUFFER, s.info_fbo);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, s.info_tex, 0);
+        s.info_w = w;
+        s.info_h = h;
+    }
+    const GLboolean scissor = glIsEnabled(GL_SCISSOR_TEST);
+    glDisable(GL_SCISSOR_TEST);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, screen_fbo);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, s.info_fbo);
+    glBlitFramebuffer(x0, y0, x1, y1, 0, 0, w, h, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+    glBindFramebuffer(GL_FRAMEBUFFER, screen_fbo);
+    if (scissor)
+        glEnable(GL_SCISSOR_TEST);
+    s.info_ready = true;
+}
+
+/** Point on the message box: 0..1 coordinates (v up) and the distance in front. */
+bool info_coords(Vec3 p, float* u, float* v, float* depth)
+{
+    const Vec3 d = p - s.info_center;
+    *u = (d.x * s.info_right.x + d.y * s.info_right.y + d.z * s.info_right.z) / s.info_world_w + 0.5f;
+    *v = (d.x * s.info_up.x + d.y * s.info_up.y + d.z * s.info_up.z) / s.info_world_h + 0.5f;
+    *depth = d.x * s.info_normal.x + d.y * s.info_normal.y + d.z * s.info_normal.z;
+    return *u >= 0.0f && *u <= 1.0f && *v >= 0.0f && *v <= 1.0f;
+}
+
+Mat4 info_model()
+{
+    Mat4 m = Mat4::Identity();
+    const Vec3 r = s.info_right * s.info_world_w, u = s.info_up * s.info_world_h;
+    m.m[0] = r.x; m.m[1] = r.y; m.m[2] = r.z;
+    m.m[4] = u.x; m.m[5] = u.y; m.m[6] = u.z;
+    m.m[8] = s.info_normal.x; m.m[9] = s.info_normal.y; m.m[10] = s.info_normal.z;
+    m.m[12] = s.info_center.x; m.m[13] = s.info_center.y; m.m[14] = s.info_center.z;
+    return m;
+}
+
+constexpr float k_info_button = 0.028f;  // hide / show button size, metres
+
+void draw_press_outline(const Mat4& view_proj, Vec3 at, Vec3 right, Vec3 up, Vec3 normal, bool flashing, float hover_size);
+
+/** Places the message box and the hide button, and handles touches on both.
+ *  Returns the touch to pass on to the game (the box's own buttons). */
+MenuInput update_info_box(Vec3 head, const Hand& hand)
+{
+    MenuInput in;
+    const bool available = s.in_level && !s.possessing && !s.menu_shown && s.info_ready && s.hands[0].tracked;
+    s.info_button_shown = available && s.panel_shown;
+    s.info_shown = available && !s.info_hidden;
+    if (s.info_button_flash > 0.0f)
+        s.info_button_flash -= s.frame_dt;
+
+    // Button: just above the panel's top-right corner.
+    if (s.info_button_shown)
+    {
+        s.info_button_center = s.panel_center + s.panel_up * (s.panel_world_h * 0.5f + k_info_button * 0.7f)
+                             + s.panel_right * (s.panel_world_w * 0.5f - k_info_button * 0.5f);
+        s.info_button_hover = false;
+        if (hand.tracked)
+        {
+            const Vec3 d = index_fingertip(hand) - s.info_button_center;
+            const float du = d.x * s.panel_right.x + d.y * s.panel_right.y + d.z * s.panel_right.z;
+            const float dv = d.x * s.panel_up.x + d.y * s.panel_up.y + d.z * s.panel_up.z;
+            const float depth = d.x * s.panel_normal.x + d.y * s.panel_normal.y + d.z * s.panel_normal.z;
+            const bool over = std::fabs(du) < k_info_button * 0.6f && std::fabs(dv) < k_info_button * 0.6f && depth > -0.05f;
+            s.info_button_hover = over && depth < 0.06f;
+            if (over && depth < 0.012f && s.info_button_armed)
+            {
+                s.info_hidden = !s.info_hidden;
+                s.info_shown = available && !s.info_hidden;
+                s.info_button_armed = false;
+                s.info_button_flash = 0.35f;
+                buzz(1, 0.6f, 0.04f);
+            }
+            else if (!over || depth > 0.03f)
+            {
+                s.info_button_armed = true;
+            }
+        }
+    }
+    if (!s.info_shown)
+    {
+        s.info_finger = false;
+        s.info_touching = false;
+        return in;
+    }
+
+    // Same scale as the wrist panel (both are copies of the same screen), to
+    // its right with the tops lined up; above the left hand without it.
+    const float metres_per_px = (s.panel_h > 0) ? s.panel_world_h / (float)s.panel_h : 0.30f / 1440.0f;
+    s.info_world_w = (float)s.info_w * metres_per_px;
+    s.info_world_h = (float)s.info_h * metres_per_px;
+    if (s.panel_shown)
+    {
+        s.info_right = s.panel_right;
+        s.info_up = s.panel_up;
+        s.info_normal = s.panel_normal;
+        s.info_center = s.panel_center + s.panel_right * (s.panel_world_w * 0.5f + 0.02f + s.info_world_w * 0.5f)
+                      + s.panel_up * (s.panel_world_h * 0.5f - s.info_world_h * 0.5f);
+    }
+    else
+    {
+        s.info_center = s.hands[0].pos + Vec3{0.0f, 0.06f + s.info_world_h * 0.5f, 0.0f};
+        Vec3 n = head - s.info_center;
+        n = n * (1.0f / std::fmax(Length(n), 1e-4f));
+        Vec3 right = { n.z, 0.0f, -n.x };
+        right = right * (1.0f / std::fmax(Length(right), 1e-4f));
+        s.info_right = right;
+        s.info_up = { n.y * right.z - n.z * right.y, n.z * right.x - n.x * right.z, n.x * right.y - n.y * right.x };
+        s.info_normal = n;
+    }
+
+    // Its own buttons, half as big again, in a centred row just under it.
+    s.info_btn_hover = -1;
+    {
+        constexpr float k_btn_scale = 1.5f;
+        constexpr float k_btn_gap = 0.012f;
+        float row_w = 0.0f, row_h = 0.0f;
+        for (int i = 0; i < s.info_btn_count; i++)
+        {
+            s.info_btn_world_w[i] = (float)s.info_btn[i].w * metres_per_px * k_btn_scale;
+            s.info_btn_world_h[i] = (float)s.info_btn[i].h * metres_per_px * k_btn_scale;
+            row_w += s.info_btn_world_w[i] + (i > 0 ? k_btn_gap : 0.0f);
+            row_h = std::fmax(row_h, s.info_btn_world_h[i]);
+        }
+        float x = -row_w * 0.5f;
+        const Vec3 row_center = s.info_center - s.info_up * (s.info_world_h * 0.5f + 0.01f + row_h * 0.5f);
+        for (int i = 0; i < s.info_btn_count; i++)
+        {
+            s.info_btn_center[i] = row_center + s.info_right * (x + s.info_btn_world_w[i] * 0.5f);
+            x += s.info_btn_world_w[i] + k_btn_gap;
+        }
+        if (hand.tracked && s.info_btn_count > 0)
+        {
+            const Vec3 tip = index_fingertip(hand);
+            for (int i = 0; i < s.info_btn_count; i++)
+            {
+                const Vec3 d = tip - s.info_btn_center[i];
+                const float du = d.x * s.info_right.x + d.y * s.info_right.y + d.z * s.info_right.z;
+                const float dv = d.x * s.info_up.x + d.y * s.info_up.y + d.z * s.info_up.z;
+                const float depth = d.x * s.info_normal.x + d.y * s.info_normal.y + d.z * s.info_normal.z;
+                if (std::fabs(du) < s.info_btn_world_w[i] * 0.6f && std::fabs(dv) < s.info_btn_world_h[i] * 0.6f
+                    && depth < 0.08f && depth > -0.06f)
+                {
+                    // Pointing at the real button's middle; pushing in presses it.
+                    if (s.info_touching ? (depth > 0.015f) : (depth < 0.004f))
+                        s.info_touching = !s.info_touching;
+                    const InfoBoxInfo::Button& b = s_info_box.buttons[i];
+                    const float bw = s_info_box.x1 - s_info_box.x0, bh = s_info_box.y1 - s_info_box.y0;
+                    in.valid = true;
+                    in.u = ((b.x0 + b.x1) * 0.5f - s_info_box.x0) / bw;
+                    in.v = 1.0f - ((b.y0 + b.y1) * 0.5f - s_info_box.y0) / bh;
+                    in.press = s.info_touching;
+                    s.info_btn_hover = i;
+                    s.info_finger = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    // Fingertip on it, as on the panel; else the forward ray with the trigger.
+    if (s.info_btn_hover < 0)
+        s.info_finger = false;
+    if (hand.tracked && s.info_btn_hover < 0)
+    {
+        float u, v, depth;
+        if (info_coords(index_fingertip(hand), &u, &v, &depth) && depth < 0.08f && depth > -0.06f)
+        {
+            if (s.info_touching ? (depth > 0.015f) : (depth < 0.004f))
+                s.info_touching = !s.info_touching;
+            in.valid = true;
+            in.u = u;
+            in.v = v;
+            in.press = s.info_touching;
+            s.info_finger = true;
+        }
+        else
+        {
+            s.info_touching = false;
+            if (hand.aim_tracked)
+            {
+                const Vec3 dir = Rotate(hand.aim_rot, {0.0f, 0.0f, -1.0f});
+                const float denom = dir.x * s.info_normal.x + dir.y * s.info_normal.y + dir.z * s.info_normal.z;
+                if (std::fabs(denom) > 1e-5f)
+                {
+                    const Vec3 to_center = s.info_center - hand.aim_pos;
+                    const float t = (to_center.x * s.info_normal.x + to_center.y * s.info_normal.y + to_center.z * s.info_normal.z) / denom;
+                    if (t > 0.0f && info_coords(hand.aim_pos + dir * t, &u, &v, &depth))
+                    {
+                        in.valid = true;
+                        in.u = u;
+                        in.v = v;
+                        in.press = hand.trigger > 0.6f;
+                    }
+                }
+            }
+        }
+        if (in.valid)
+            s.info_pointer = s.info_center + s.info_right * ((in.u - 0.5f) * s.info_world_w)
+                           + s.info_up * ((in.v - 0.5f) * s.info_world_h);
+    }
+    if (s.info_flash_time > 0.0f)
+        s.info_flash_time -= s.frame_dt;
+    if (in.valid && in.press && !s.info_was_pressed)
+    {
+        s.info_flash_time = 0.35f;
+        s.info_btn_flash = s.info_btn_hover;
+        buzz(1, 0.6f, 0.04f);
+    }
+    s.info_was_pressed = in.valid && in.press;
+    return in;
+}
+
+/** New text: raise the alert when a message box opens or shows a different
+ *  message, buzz the left controller every couple of seconds (a few times),
+ *  and drop it once the text is looked at. */
+void update_text_alert(Vec3 gaze)
+{
+    const bool visible = s_info_box.visible && s.in_level;
+    if (visible && (!s.text_was_visible || s_info_box.message_id != s.text_last_message))
+    {
+        s.text_alert = true;
+        s.text_alert_pulses = 0;
+        s.text_alert_timer = 0.0f;
+    }
+    s.text_was_visible = visible;
+    if (visible)
+        s.text_last_message = s_info_box.message_id;
+    if (!visible)
+        s.text_alert = false;
+    if (!s.text_alert)
+        return;
+
+    // Looked at: the box is shown in VR and the head points at it (within about 20 degrees).
+    if (s.info_shown)
+    {
+        Vec3 to_box = s.info_center - s.last_head;
+        const float len = Length(to_box);
+        if (len > 0.01f)
+        {
+            to_box = to_box * (1.0f / len);
+            if (to_box.x * gaze.x + to_box.y * gaze.y + to_box.z * gaze.z > 0.94f)
+            {
+                s.text_alert = false;
+                return;
+            }
+        }
+    }
+    constexpr int k_pulses = 4;
+    constexpr float k_pulse_every = 1.8f;  // seconds
+    s.text_alert_timer -= s.frame_dt;
+    if (s.text_alert_timer <= 0.0f && s.text_alert_pulses < k_pulses)
+    {
+        buzz(0, 0.45f, 0.08f);
+        s.text_alert_pulses++;
+        s.text_alert_timer = k_pulse_every;
+    }
+}
+
+/** Draws the message box and the hide button. Solid program and cube bound. */
+void draw_info_box(const Mat4& view_proj)
+{
+    if (s.info_button_shown)
+    {
+        // A small tablet: gold while the text shows, dim while hidden, with
+        // two dark "text lines" on it.
+        const float grow = (s.info_button_flash > 0.0f) ? 1.25f : s.info_button_hover ? 1.12f : 1.0f;
+        const float size = k_info_button * grow;
+        auto plate = [&](Vec3 c, float w, float h, float lift) {
+            Mat4 m = Mat4::Identity();
+            const Vec3 r = s.panel_right * w, u = s.panel_up * h, d = s.panel_normal * 0.003f;
+            const Vec3 at = c + s.panel_normal * lift;
+            m.m[0] = r.x; m.m[1] = r.y; m.m[2] = r.z;
+            m.m[4] = u.x; m.m[5] = u.y; m.m[6] = u.z;
+            m.m[8] = d.x; m.m[9] = d.y; m.m[10] = d.z;
+            m.m[12] = at.x; m.m[13] = at.y; m.m[14] = at.z;
+            const Mat4 mvp = view_proj * m;
+            glUniformMatrix4fv(s.loc_solid_mvp, 1, GL_FALSE, mvp.m);
+            glDrawArrays(GL_TRIANGLES, 0, 36);
+        };
+        if (s.info_button_flash > 0.0f)
+            glUniform4f(s.loc_solid_color, 0.45f, 1.0f, 0.45f, 1.0f);
+        else if (s.info_hidden)
+            glUniform4f(s.loc_solid_color, 0.40f, 0.36f, 0.30f, 1.0f);
+        else
+            glUniform4f(s.loc_solid_color, 1.0f, 0.82f, 0.25f, 1.0f);
+        plate(s.info_button_center, size, size, 0.0f);
+        glUniform4f(s.loc_solid_color, 0.15f, 0.08f, 0.05f, 1.0f);
+        plate(s.info_button_center + s.panel_up * (size * 0.15f), size * 0.62f, size * 0.1f, 0.003f);
+        plate(s.info_button_center - s.panel_up * (size * 0.15f), size * 0.45f, size * 0.1f, 0.003f);
+    }
+    if (!s.info_shown)
+        return;
+    glUseProgram(s.panel_prog);
+    const Mat4 mvp = view_proj * info_model();
+    glUniformMatrix4fv(s.loc_panel_mvp, 1, GL_FALSE, mvp.m);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, s.info_tex);
+    glDrawArrays(GL_TRIANGLES, 0, 36);
+    // The repeated buttons under it.
+    for (int i = 0; i < s.info_btn_count; i++)
+    {
+        Mat4 m = Mat4::Identity();
+        const Vec3 r = s.info_right * s.info_btn_world_w[i], u = s.info_up * s.info_btn_world_h[i];
+        const Vec3 c = s.info_btn_center[i];
+        m.m[0] = r.x; m.m[1] = r.y; m.m[2] = r.z;
+        m.m[4] = u.x; m.m[5] = u.y; m.m[6] = u.z;
+        m.m[8] = s.info_normal.x; m.m[9] = s.info_normal.y; m.m[10] = s.info_normal.z;
+        m.m[12] = c.x; m.m[13] = c.y; m.m[14] = c.z;
+        const Mat4 bmvp = view_proj * m;
+        glUniformMatrix4fv(s.loc_panel_mvp, 1, GL_FALSE, bmvp.m);
+        glBindTexture(GL_TEXTURE_2D, s.info_btn[i].tex);
+        glDrawArrays(GL_TRIANGLES, 0, 36);
+    }
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glUseProgram(s.solid_prog);
+    if (s.info_btn_hover >= 0)
+    {
+        const int i = s.info_btn_hover;
+        const bool flashing = s.info_flash_time > 0.0f && s.info_btn_flash == i;
+        draw_press_outline(view_proj, s.info_btn_center[i], s.info_right, s.info_up, s.info_normal, flashing,
+                           std::fmax(s.info_btn_world_w[i], s.info_btn_world_h[i]) * 1.1f);
+    }
+    else if (s_info_in.valid)
+    {
+        draw_press_outline(view_proj, s.info_pointer, s.info_right, s.info_up, s.info_normal,
+                           s.info_flash_time > 0.0f, 0.018f);
+    }
+}
+
+/******************************************************************************/
+// Palm menu: turn the left palm up and the creature types you own float above
+// it; tap one with the right index finger to pick up one of them.
+
+struct UiDraw {
+    int32_t sprite_id;
+    int first_vertex;
+};
+std::vector<SpriteVertex> s_ui_verts;
+std::vector<UiDraw> s_ui_draws;
+
+/** A highlight frame behind a palm icon: gold while hovered, green just after a tap. */
+struct UiFrame {
+    Vec3 center;
+    float w, h;
+    bool tapped;
+};
+std::vector<UiFrame> s_ui_frames;
+
+constexpr int k_palm_columns = 4;
+constexpr float k_palm_icon = 0.045f;    // icon height, metres
+constexpr float k_palm_gap = 0.012f;
+
+/** Centre of icon @p i in the grid floating above the palm. */
+Vec3 palm_icon_center(Vec3 origin, int i, int rows)
+{
+    const int row = i / k_palm_columns, col = i % k_palm_columns;
+    const float step = k_palm_icon + k_palm_gap;
+    const float x = ((float)col - (float)(k_palm_columns - 1) * 0.5f) * step;
+    const float y = ((float)(rows - 1) * 0.5f - (float)row) * (step + 0.012f);  // room for the count below
+    return origin + s.palm_right * x + s.palm_up * y;
+}
+
+void add_ui_quad(int32_t sprite_id, Vec3 center, float w, float h)
+{
+    const Vec3 r = s.palm_right * (w * 0.5f), u = s.palm_up * (h * 0.5f);
+    const Vec3 tl = center - r + u, tr = center + r + u, br = center + r - u, bl = center - r - u;
+    s_ui_draws.push_back({ sprite_id, (int)s_ui_verts.size() });
+    const SpriteVertex v[6] = {
+        { tl.x, tl.y, tl.z, 0, 0, -1, -1 }, { tr.x, tr.y, tr.z, 1, 0, -1, -1 }, { br.x, br.y, br.z, 1, 1, -1, -1 },
+        { br.x, br.y, br.z, 1, 1, -1, -1 }, { bl.x, bl.y, bl.z, 0, 1, -1, -1 }, { tl.x, tl.y, tl.z, 0, 0, -1, -1 },
+    };
+    s_ui_verts.insert(s_ui_verts.end(), v, v + 6);
+}
+
+/** Lays out the palm menu, handles taps, and builds its quads for this frame. */
+void update_palm_menu(Vec3 head)
+{
+    s_ui_verts.clear();
+    s_ui_draws.clear();
+    s_ui_frames.clear();
+    if (s.palm_flash_time > 0.0f)
+        s.palm_flash_time -= s.frame_dt;
+    const Hand& left = s.hands[0];
+    const Vec3 palm_normal = Rotate(left.aim_rot, {1.0f, 0.0f, 0.0f});  // a left palm faces +X
+    s.palm_shown = s.in_level && !s.possessing && !s.menu_shown && !s.ray_left && left.tracked && left.aim_tracked
+                && palm_normal.y > 0.6f && !s_things.palm.empty();
+    if (!s.palm_shown)
+    {
+        s.palm_touched = -1;
+        s.palm_hover = -1;
+        s.palm_armed = true;
+        return;
+    }
+    // A grid standing just above the palm, turned to face the head.
+    const Vec3 origin = left.pos + Vec3{0.0f, 0.13f, 0.0f};
+    Vec3 n = head - origin;
+    n = n * (1.0f / std::fmax(Length(n), 1e-4f));
+    Vec3 right = { n.z, 0.0f, -n.x };
+    right = right * (1.0f / std::fmax(Length(right), 1e-4f));
+    s.palm_right = right;
+    s.palm_up = { n.y * right.z - n.z * right.y, n.z * right.x - n.x * right.z, n.x * right.y - n.y * right.x };
+    s.palm_normal = n;
+
+    const int count = (int)s_things.palm.size();
+    const int rows = (count + k_palm_columns - 1) / k_palm_columns;
+    // Which icon the right index fingertip is in front of (hover) or pushed into (touch).
+    s.palm_touched = -1;
+    s.palm_hover = -1;
+    if (s.hands[1].tracked)
+    {
+        const Vec3 tip = index_fingertip(s.hands[1]);
+        for (int i = 0; i < count; i++)
+        {
+            const Vec3 d = tip - palm_icon_center(origin, i, rows);
+            const float du = d.x * s.palm_right.x + d.y * s.palm_right.y + d.z * s.palm_right.z;
+            const float dv = d.x * s.palm_up.x + d.y * s.palm_up.y + d.z * s.palm_up.z;
+            const float depth = d.x * n.x + d.y * n.y + d.z * n.z;
+            if (std::fabs(du) < k_palm_icon * 0.55f && std::fabs(dv) < k_palm_icon * 0.55f && depth > -0.05f)
+            {
+                if (depth < 0.06f)
+                    s.palm_hover = i;
+                if (depth < 0.015f)
+                    s.palm_touched = i;
+                if (s.palm_hover >= 0)
+                    break;
+            }
+        }
+    }
+    if (s.palm_touched >= 0 && s.palm_armed)
+    {
+        s_palm_pick_kind = s_things.palm[(size_t)s.palm_touched].kind;
+        s.palm_armed = false;  // one creature per tap
+        s.palm_flash = s.palm_touched;
+        s.palm_flash_time = 0.35f;
+        buzz(1, 0.6f, 0.04f);
+    }
+    else if (s.palm_touched < 0)
+    {
+        s.palm_armed = true;
+    }
+
+    for (int i = 0; i < count; i++)
+    {
+        const PalmItem& item = s_things.palm[(size_t)i];
+        const Vec3 c = palm_icon_center(origin, i, rows);
+        const auto size = s.sprite_sizes.find(item.sprite_id);
+        float aspect = 1.0f;
+        if (size != s.sprite_sizes.end() && size->second.second > 0)
+            aspect = (float)size->second.first / (float)size->second.second;
+        const bool flashing = (i == s.palm_flash && s.palm_flash_time > 0.0f);
+        const bool hovered = (i == s.palm_hover);
+        const float grow = flashing ? 1.3f : hovered ? 1.15f : 1.0f;
+        add_ui_quad(item.sprite_id, c, k_palm_icon * aspect * grow, k_palm_icon * grow);
+        if (flashing || hovered)
+            s_ui_frames.push_back({ c, k_palm_icon * aspect * grow + 0.008f, k_palm_icon * grow + 0.008f, flashing });
+        // The count, small and centred under the icon.
+        char digits[8];
+        const int len = std::snprintf(digits, sizeof(digits), "%d", item.count);
+        const float dh = 0.012f, dw = dh * s_things.digit_aspect;
+        const Vec3 below = c - s.palm_up * (k_palm_icon * 0.5f + dh * 0.6f);
+        for (int k = 0; k < len; k++)
+        {
+            const int d = digits[k] - '0';
+            if (d < 0 || d > 9 || s_things.digit_sprite[d] == 0)
+                continue;
+            add_ui_quad(s_things.digit_sprite[d], below + s.palm_right * (((float)k - (float)(len - 1) * 0.5f) * dw), dw, dh);
+        }
+    }
+    glBindBuffer(GL_ARRAY_BUFFER, s.ui_vbo);
+    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(s_ui_verts.size() * sizeof(SpriteVertex)),
+                 s_ui_verts.empty() ? nullptr : s_ui_verts.data(), GL_STREAM_DRAW);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+}
+
+/** Draws the palm menu. Expects the palette and fade table bound on units 1
+ *  and 3 (the lightmap is not used: the icons are fully lit). */
+void draw_palm_menu(const Mat4& view_proj, const GLWorldViewRenderer::VRTextures& tex)
+{
+    if (!s.palm_shown || s_ui_draws.empty())
+        return;
+
+    // Highlight frames, a little behind their icons.
+    glUseProgram(s.solid_prog);
+    glBindVertexArray(s.cube_vao);
+    for (const UiFrame& f : s_ui_frames)
+    {
+        Mat4 m = Mat4::Identity();
+        const Vec3 r = s.palm_right * f.w, u = s.palm_up * f.h, d = s.palm_normal * 0.002f;
+        const Vec3 c = f.center - s.palm_normal * 0.003f;
+        m.m[0] = r.x; m.m[1] = r.y; m.m[2] = r.z;
+        m.m[4] = u.x; m.m[5] = u.y; m.m[6] = u.z;
+        m.m[8] = d.x; m.m[9] = d.y; m.m[10] = d.z;
+        m.m[12] = c.x; m.m[13] = c.y; m.m[14] = c.z;
+        const Mat4 mvp = view_proj * m;
+        glUniformMatrix4fv(s.loc_solid_mvp, 1, GL_FALSE, mvp.m);
+        if (f.tapped)
+            glUniform4f(s.loc_solid_color, 0.45f, 1.0f, 0.45f, 1.0f);
+        else
+            glUniform4f(s.loc_solid_color, 1.0f, 0.82f, 0.25f, 1.0f);
+        glDrawArrays(GL_TRIANGLES, 0, 36);
+    }
+    glBindVertexArray(0);
+
+    glUseProgram(s.sprite_prog);
+    glUniformMatrix4fv(s.loc_sprite_mvp, 1, GL_FALSE, view_proj.m);
+    glUniform1i(s.loc_sprite_use_fade, tex.fade != 0 ? 1 : 0);
+    glUniform1f(s.loc_sprite_alpha, 1.0f);
+    glUniform1i(s.loc_sprite_shadow, 0);
+    glUniform1f(s.loc_sprite_one_colour, -1.0f);
+    glBindVertexArray(s.ui_vao);
+    glActiveTexture(GL_TEXTURE0);
+    for (const UiDraw& d : s_ui_draws)
+    {
+        const auto it = s.sprite_textures.find(d.sprite_id);
+        if (it == s.sprite_textures.end())
+            continue;
+        glBindTexture(GL_TEXTURE_2D, it->second);
+        glDrawArrays(GL_TRIANGLES, d.first_vertex, 6);
+    }
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glBindVertexArray(0);
+}
+
 /** Uploads sprite images the game thread decoded. */
 void apply_sprite_images()
 {
@@ -1372,6 +2126,7 @@ void apply_sprite_images()
     for (const SpriteImage& img : s_things.new_images)
     {
         GLuint& tex = s.sprite_textures[img.id];
+        s.sprite_sizes[img.id] = { img.w, img.h };
         if (tex == 0)
             glGenTextures(1, &tex);
         glBindTexture(GL_TEXTURE_2D, tex);
@@ -1741,6 +2496,15 @@ void update_input(XrTime time, float dt)
         s.panel_auto_hidden = false;  // the player decides from here
     }
 
+    get.action = s.pause_action;
+    XrActionStateBoolean pause = {XR_TYPE_ACTION_STATE_BOOLEAN};
+    if (XR_SUCCEEDED(xrGetActionStateBoolean(s.session, &get, &pause)) &&
+        pause.isActive && pause.changedSinceLastSync && pause.currentState)
+    {
+        s_pause_request = true;
+        buzz(0, 0.5f, 0.05f);
+    }
+
     get.action = s.scroll_action;
     XrActionStateVector2f stick = {XR_TYPE_ACTION_STATE_VECTOR2F};
     if (XR_SUCCEEDED(xrGetActionStateVector2f(s.session, &get, &stick)) && stick.isActive)
@@ -1992,6 +2756,37 @@ void draw_selection(const Mat4& mvp)
     glBindVertexArray(0);
 }
 
+/** A square outline around a pointer on a flat screen (menu screen, wrist
+ *  panel): gold while hovering, green and larger for a moment once a press
+ *  lands, as the palm icons do. Uses the solid program and cube, bound. */
+void draw_press_outline(const Mat4& view_proj, Vec3 at, Vec3 right, Vec3 up, Vec3 normal, bool flashing, float hover_size)
+{
+    const float size = flashing ? hover_size * 1.55f : hover_size;
+    const float bar = 0.003f;
+    const Vec3 c = at + normal * 0.002f;
+    if (flashing)
+        glUniform4f(s.loc_solid_color, 0.45f, 1.0f, 0.45f, 1.0f);
+    else
+        glUniform4f(s.loc_solid_color, 1.0f, 0.82f, 0.25f, 1.0f);
+    for (int side = 0; side < 4; side++)
+    {
+        const bool horizontal = (side < 2);
+        const float offset = (side % 2 == 0 ? 0.5f : -0.5f) * size;
+        const Vec3 centre = horizontal ? c + up * offset : c + right * offset;
+        const Vec3 r = right * (horizontal ? size + bar : bar);
+        const Vec3 u = up * (horizontal ? bar : size + bar);
+        const Vec3 d = normal * 0.001f;
+        Mat4 m = Mat4::Identity();
+        m.m[0] = r.x; m.m[1] = r.y; m.m[2] = r.z;
+        m.m[4] = u.x; m.m[5] = u.y; m.m[6] = u.z;
+        m.m[8] = d.x; m.m[9] = d.y; m.m[10] = d.z;
+        m.m[12] = centre.x; m.m[13] = centre.y; m.m[14] = centre.z;
+        const Mat4 mvp = view_proj * m;
+        glUniformMatrix4fv(s.loc_solid_mvp, 1, GL_FALSE, mvp.m);
+        glDrawArrays(GL_TRIANGLES, 0, 36);
+    }
+}
+
 void draw_lit_box(const Mat4& view_proj, const Mat4& model, float r, float g, float b)
 {
     const Mat4 mvp = view_proj * model;
@@ -2013,8 +2808,10 @@ void draw_keeper_hand(const Mat4& view_proj, const Hand& hand)
     constexpr float skin[3]   = { 0.80f, 0.68f, 0.58f };
     constexpr float claw[3]   = { 0.22f, 0.10f, 0.08f };
     constexpr float sleeve[3] = { 0.45f, 0.08f, 0.10f };
-    const float index_curl = hand.trigger;
-    const float fist_curl = hand.grip;
+    // Pointing at a button (palm menu, menu screen): index straight, the rest curled.
+    const float point = (&hand == &s.hands[1]) ? s.point_pose : 0.0f;
+    const float index_curl = hand.trigger * (1.0f - point);
+    const float fist_curl = std::fmax(hand.grip, point);
 
     glUseProgram(s.lit_prog);
     const float light_len = std::sqrt(0.3f * 0.3f + 0.9f * 0.9f + 0.4f * 0.4f);
@@ -2210,6 +3007,7 @@ void draw_eye(const EyeTarget& eye, const Mat4& view_proj, const GLWorldViewRend
 
         draw_sprites(mvp, tex);
         draw_selection(mvp);
+        draw_palm_menu(view_proj, tex);
 
         glActiveTexture(GL_TEXTURE3);
         glBindTexture(GL_TEXTURE_2D, 0);
@@ -2255,10 +3053,16 @@ void draw_eye(const EyeTarget& eye, const Mat4& view_proj, const GLWorldViewRend
     {
         if (!hand.tracked || &hand == &s.hands[1] || (s.ray_left && &hand == &s.hands[0]))
             continue;
-        const Mat4 mvp = view_proj * Mat4::FromPose(hand.rot, hand.pos) * Mat4::Scale({0.03f, 0.03f, 0.09f});
+        // New text waiting: glow yellow, pulsing and a little bigger.
+        const bool alert = s.text_alert && &hand == &s.hands[0];
+        const float pulse = alert ? 0.5f + 0.5f * std::sin((float)s.frames_rendered * 0.12f) : 0.0f;
+        const float grow = 1.0f + 0.25f * pulse;
+        const Mat4 mvp = view_proj * Mat4::FromPose(hand.rot, hand.pos) * Mat4::Scale({0.03f * grow, 0.03f * grow, 0.09f * grow});
         glUniformMatrix4fv(s.loc_solid_mvp, 1, GL_FALSE, mvp.m);
         if (hand.grabbing)
             glUniform4f(s.loc_solid_color, 0.35f, 0.85f, 0.35f, 1.0f);
+        else if (alert)
+            glUniform4f(s.loc_solid_color, 0.85f + 0.15f * pulse, 0.70f + 0.25f * pulse, 0.10f + 0.25f * pulse, 1.0f);
         else
             glUniform4f(s.loc_solid_color, 0.75f, 0.70f, 0.60f, 1.0f);
         glDrawArrays(GL_TRIANGLES, 0, 36);
@@ -2277,15 +3081,8 @@ void draw_eye(const EyeTarget& eye, const Mat4& view_proj, const GLWorldViewRend
         glUseProgram(s.solid_prog);
         if (s.menu_pointer_valid)
         {
-            const float size = s.menu_touching ? 0.008f : 0.005f;
-            const Mat4 dot = view_proj * Mat4::Translation(s.menu_pointer + s.menu_normal * 0.002f)
-                           * Mat4::Scale({size, size, size});
-            glUniformMatrix4fv(s.loc_solid_mvp, 1, GL_FALSE, dot.m);
-            if (s.menu_touching || (s.menu_by_ray && s.hands[1].trigger > 0.6f))
-                glUniform4f(s.loc_solid_color, 1.0f, 0.85f, 0.3f, 1.0f);
-            else
-                glUniform4f(s.loc_solid_color, 0.9f, 0.5f, 0.2f, 1.0f);
-            glDrawArrays(GL_TRIANGLES, 0, 36);
+            draw_press_outline(view_proj, s.menu_pointer, s.menu_right, s.menu_up, s.menu_normal,
+                               s.menu_flash_time > 0.0f, 0.032f);
             if (s.menu_by_ray)
             {
                 const Hand& h = s.hands[1];
@@ -2311,12 +3108,20 @@ void draw_eye(const EyeTarget& eye, const Mat4& view_proj, const GLWorldViewRend
         glBindTexture(GL_TEXTURE_2D, 0);
         glUseProgram(s.solid_prog);
     }
+    draw_info_box(view_proj);
 
+    // The fingertip on the wrist panel: an outline instead of the laser.
+    if (s_pointer_in.valid && s.panel_finger)
+    {
+        draw_press_outline(view_proj, s.panel_pointer, s.panel_right, s.panel_up, s.panel_normal,
+                           s.panel_flash_time > 0.0f, 0.018f);
+    }
     // Pointing ray (right hand, or the left one casting a spell), ending in a
     // marker where it meets the dungeon or the panel. Brighter while the
     // trigger is held.
-    if (s_pointer_in.valid && s.ray_valid)
+    else if (s_pointer_in.valid && s.ray_valid && (s_pointer_in.panel_hit || s_pointer_out.hit))
     {
+        // Only drawn when it lands on something (the table or the panel).
         float length = 2.0f;
         Vec3 hit_stage = {0, 0, 0};
         const bool ends = s_pointer_in.panel_hit || s_pointer_out.hit;
@@ -2417,16 +3222,35 @@ bool render_views(GLWorldViewRenderer& world, XrTime time,
         s.panel_hidden = true;
         s.panel_auto_hidden = true;
     }
-    if (!s_possess_chosen && !s.possessing && s.panel_auto_hidden)
+    s.possess_was_chosen = s_possess_chosen;
+    // Likewise picking a tool from the panel (a room, spell, trap, door,
+    // sell...): the player state changes just after a press on the panel.
+    // Tabs and scrolling do not change it, so they leave the panel open.
+    if (s.panel_click_time > 0.0f)
+        s.panel_click_time -= s.frame_dt;
+    if (s_work_state != s.last_work_state)
+    {
+        if (s.panel_click_time > 0.0f && !s_plain_hand && !s.panel_hidden)
+        {
+            s.panel_hidden = true;
+            s.panel_auto_hidden = true;
+        }
+        s.last_work_state = s_work_state;
+    }
+    // Back to the plain hand (placed, cast, cancelled with A, creature left):
+    // the panel returns for the next pick.
+    if (s.panel_auto_hidden && s_plain_hand && !s_possess_chosen && !s.possessing)
     {
         s.panel_hidden = false;
         s.panel_auto_hidden = false;
     }
-    s.possess_was_chosen = s_possess_chosen;
 
     // While possessing there is no ray or panel; the buttons still go through
     // (trigger attacks, A leaves the creature).
-    s.panel_shown = !s.panel_hidden && s.in_level && !s.possessing && place_panel(head);
+    // Turning the left palm up swaps the panel for the palm menu.
+    const bool palm_up = s.hands[0].aim_tracked && Rotate(s.hands[0].aim_rot, {1.0f, 0.0f, 0.0f}).y > 0.6f
+                      && !s_things.palm.empty();
+    s.panel_shown = !s.panel_hidden && s.in_level && !s.possessing && !palm_up && place_panel(head);
     s.ray_valid = pointer.aim_tracked && pointer.tracked && !s.possessing;
     s.ray_forward = s.panel_shown;
     if (s.ray_valid && s.ray_forward)
@@ -2441,12 +3265,42 @@ bool render_views(GLWorldViewRenderer& world, XrTime time,
     }
     if (s.ray_valid && s.panel_shown)
         in.panel_hit = ray_hits_panel(s.ray_origin, s.ray_dir, &in.panel_u, &in.panel_v, &s.panel_pointer);
+    // The index fingertip on the panel: hovering moves the cursor there,
+    // pushing in clicks, as on the menu screen. It takes over from the ray.
+    s.panel_finger = false;
+    if (s.panel_shown && pointer.tracked)
+    {
+        const Vec3 tip = index_fingertip(pointer);
+        float u, v, depth;
+        if (panel_coords(tip, &u, &v, &depth) && depth < 0.08f && depth > -0.06f)
+        {
+            if (s.panel_touching ? (depth > 0.015f) : (depth < 0.004f))
+                s.panel_touching = !s.panel_touching;
+            s.panel_finger = true;
+            in.panel_hit = true;
+            in.panel_u = u;
+            in.panel_v = v;
+            s.panel_pointer = s.panel_center + s.panel_right * ((u - 0.5f) * s.panel_world_w)
+                            + s.panel_up * ((v - 0.5f) * s.panel_world_h);
+        }
+        else
+        {
+            s.panel_touching = false;
+        }
+    }
+    else
+    {
+        s.panel_touching = false;
+    }
     s.ray_rot = pointer.aim_rot;
     // A spell is chosen: the left hand casts it, forward along the controller,
     // with its own trigger; the right hand stays free for the panel (to pick
     // another) and its A cancels, as right-click does.
     const Hand& caster = s.hands[0];
-    s.ray_left = s_spell_chosen && !in.panel_hit && caster.aim_tracked && s.in_level && !s.possessing;
+    // Off for now: switching hands felt clumsy, so spells cast from the right
+    // hand like everything else. The left-hand caster stays for a later try.
+    constexpr bool k_left_hand_casts = false;
+    s.ray_left = k_left_hand_casts && s_spell_chosen && !in.panel_hit && caster.aim_tracked && s.in_level && !s.possessing;
     s.ray_palm_sign = -1.0f;  // a right palm faces -X
     if (s.ray_left)
     {
@@ -2459,6 +3313,12 @@ bool render_views(GLWorldViewRenderer& world, XrTime time,
         s.ray_rot = caster.aim_rot;
     }
     const Hand& ray_hand = s.ray_left ? caster : pointer;
+    // The palm ray only works the dungeon while it points down at it; a hand
+    // held level or on its side (a handshake) leaves the cursor alone and
+    // shows no laser. The panel takes the ray at any angle.
+    constexpr float k_min_down = 0.25f;  // about 15 degrees below level
+    if (s.ray_valid && !s.ray_forward && !in.panel_hit && s.ray_dir.y > -k_min_down)
+        s.ray_valid = false;
     if (s.ray_valid && s.in_level)
     {
         const Vec3 origin = stage_to_game(s.ray_origin);
@@ -2468,7 +3328,7 @@ bool render_views(GLWorldViewRenderer& world, XrTime time,
         in.dx = ahead.x - origin.x; in.dy = ahead.y - origin.y; in.dz = ahead.z - origin.z;
         if (s_select_held ? (ray_hand.trigger < 0.35f) : (ray_hand.trigger > 0.6f))
             s_select_held = !s_select_held;
-        in.select = s_select_held;
+        in.select = s.panel_finger ? s.panel_touching : s_select_held;
         in.action = pointer.action;
     }
     else if (s.possessing && s.in_level)
@@ -2494,7 +3354,56 @@ bool render_views(GLWorldViewRenderer& world, XrTime time,
         s.panel_shown = false;
         s_select_held = false;
     }
+    // Confirm a press on the panel (finger or ray): a flash and a short buzz.
+    if (s.panel_flash_time > 0.0f)
+        s.panel_flash_time -= s.frame_dt;
+    const bool panel_pressed = in.valid && in.panel_hit && in.select;
+    if (panel_pressed && !s.panel_was_pressed)
+    {
+        s.panel_flash_time = 0.35f;
+        buzz(1, 0.6f, 0.04f);
+    }
+    if (panel_pressed)
+        s.panel_click_time = 0.6f;  // a tool picked within this time folds the panel away
+    s.panel_was_pressed = panel_pressed;
+    // The message box beside the panel: its touch goes to the game in place
+    // of the dungeon pointer (see GameThreadSync()).
+    s_info_in = update_info_box(head, pointer);
+    if (s_info_in.valid)
+        s.ray_valid = false;
+    update_text_alert(head_gaze);
     s_pointer_in = in;
+    update_palm_menu(head);
+
+    // Ease the right hand into a pointing pose (index out, the rest curled)
+    // while its fingertip nears something to press.
+    {
+        bool near_button = false;
+        if (s.hands[1].tracked)
+        {
+            const Vec3 tip = index_fingertip(s.hands[1]);
+            if (s.palm_shown)
+                near_button = Length(tip - (s.hands[0].pos + Vec3{0.0f, 0.13f, 0.0f})) < 0.20f;
+            float u, v, depth;
+            if (!near_button && s.menu_shown && menu_coords(tip, &u, &v, &depth))
+                near_button = depth < 0.15f && depth > -0.08f;
+            if (!near_button && s.panel_shown && panel_coords(tip, &u, &v, &depth))
+                near_button = depth < 0.15f && depth > -0.08f;
+            if (!near_button && s.info_shown && info_coords(tip, &u, &v, &depth))
+                near_button = depth < 0.15f && depth > -0.08f;
+            if (!near_button && s.info_shown && s.info_btn_count > 0)
+            {
+                // The button row under the box: a band just below its lower edge.
+                const Vec3 d = tip - (s.info_center - s.info_up * (s.info_world_h * 0.5f + 0.03f));
+                const float du = d.x * s.info_right.x + d.y * s.info_right.y + d.z * s.info_right.z;
+                const float dv = d.x * s.info_up.x + d.y * s.info_up.y + d.z * s.info_up.z;
+                const float dd = d.x * s.info_normal.x + d.y * s.info_normal.y + d.z * s.info_normal.z;
+                near_button = std::fabs(du) < s.info_world_w * 0.5f && std::fabs(dv) < 0.05f && dd < 0.15f && dd > -0.08f;
+            }
+        }
+        const float target = near_button ? 1.0f : 0.0f;
+        s.point_pose += (target - s.point_pose) * std::fmin(1.0f, s.frame_dt * 10.0f);
+    }
 
     const GLWorldViewRenderer::VRTextures tex = world.GetVRTextures();
     if ((s.frames_rendered++ % 450) == 0)
@@ -2571,6 +3480,12 @@ void GameThreadSync()
         FollowDefaultAudioDevice();
     }
 
+    if (s_pause_request)
+    {
+        s_pause_request = false;
+        s_pause_pending = true;  // taken by the input code via VR_ConsumePauseRequest()
+    }
+
     UpdateDungeonSnapshot(s_snapshot);
     s_menu_wanted = MenuScreenWanted(s_snapshot.in_level);
     if (s_snapshot.in_level)
@@ -2597,11 +3512,21 @@ void GameThreadSync()
         UpdateThingSnapshot(s_things);
         if (s_menu_wanted)
             ApplyMenuTouch(s_menu_in);  // a menu window over the level has the hand
+        else if (s_info_in.valid)
+            ApplyInfoTouch(s_info_in, s_info_box);  // the message box beside the panel
         else
             ApplyPointer(s_pointer_in, &s_pointer_out);
         GetPanelInfo(&s_panel_info);
+        GetInfoBox(&s_info_box);
         s_spell_chosen = SpellChosen();
         s_possess_chosen = PossessChosen();
+        s_work_state = PlayerWorkState();
+        s_plain_hand = PlainHand();
+        if (s_palm_pick_kind != 0)
+        {
+            PickUpCreatureOfKind(s_palm_pick_kind);  // tapped on the palm menu
+            s_palm_pick_kind = 0;
+        }
 
         // Listen where the head looks at the table; straight below the head
         // if the gaze misses the map.
@@ -2635,6 +3560,7 @@ void GameThreadSync()
         s_look_game.valid = false;
         s_spell_chosen = false;
         s_possess_chosen = false;
+        s_info_box.visible = false;
         ApplyMenuTouch(s_menu_in);  // frontend menus: main menu, campaign map, ...
     }
 }
@@ -2694,6 +3620,7 @@ void RenderThreadFrame(GLWorldViewRenderer& world, unsigned int screen_fbo, int 
         return;
     capture_panel((GLuint)screen_fbo, screen_w, screen_h);
     capture_menu((GLuint)screen_fbo, screen_w, screen_h);
+    capture_info((GLuint)screen_fbo, screen_w, screen_h);
 
     XrFrameWaitInfo wait_info = {XR_TYPE_FRAME_WAIT_INFO};
     XrFrameState frame_state = {XR_TYPE_FRAME_STATE};
@@ -2749,6 +3676,14 @@ int VR_GetSoundListener(int* x, int* y, int* z, int* angle)
     return 1;
 }
 
+int VR_ConsumePauseRequest(void)
+{
+    if (!vr_requested || !VR::s_pause_pending)
+        return 0;
+    VR::s_pause_pending = false;
+    return 1;
+}
+
 int VR_GetPossessionControls(int* yaw, int* pitch, int* move_x, int* move_y)
 {
     if (!vr_requested || !VR::s_look_game.valid)
@@ -2777,6 +3712,7 @@ void RenderThreadShutdown() {}
 
 int VR_GetSoundListener(int*, int*, int*, int*) { return 0; }
 int VR_IsHeadsetActive(void) { return 0; }
+int VR_ConsumePauseRequest(void) { return 0; }
 int VR_GetPossessionControls(int*, int*, int*, int*) { return 0; }
 
 #include "post_inc.h"

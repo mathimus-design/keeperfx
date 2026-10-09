@@ -39,6 +39,13 @@ enum SpriteKind : uint8_t {
     SK_Shadow  = 1,  /**< A soft round shadow flat on the floor; left/right/bottom/top are its radii. */
 };
 
+/** One creature type on the palm menu. */
+struct PalmItem {
+    int32_t sprite_id;      /**< Its icon (panel sprite), in the sprite image cache. */
+    int kind;               /**< Creature model. */
+    int count;              /**< How many the player has. */
+};
+
 /** sprite_id of a plain filled quad, coloured by one_colour (flag poles, bars). */
 constexpr int32_t k_solid_sprite_id = -3;
 
@@ -60,6 +67,9 @@ struct ThingSnapshot {
     // Game thread -> render thread
     std::vector<SpriteBillboard> sprites;    /**< This frame's things (replaced each frame). */
     std::vector<SelectionTile> selection;    /**< The cursor box's slabs (replaced each frame). */
+    std::vector<PalmItem> palm;              /**< Owned creature types, digger first (replaced each frame). */
+    int32_t digit_sprite[10] = {};           /**< Number digits 0-9 for the counts. */
+    float digit_aspect = 1.0f;               /**< Digit width / height. */
     std::vector<SpriteImage> new_images;     /**< Not yet uploaded; the render thread empties it. */
     // Render thread -> game thread
     bool viewer_valid = false;
@@ -81,6 +91,10 @@ struct PossessionView {
 
 /** Game thread: fill @p out from the local player's view. */
 void GetPossessionView(PossessionView* out);
+
+/** Game thread: pick up the player's next creature of @p kind into the hand,
+ *  as clicking its icon in the panel's creature tab does. */
+void PickUpCreatureOfKind(int kind);
 
 /** Game thread: refresh @p snap from the map's things. */
 void UpdateThingSnapshot(ThingSnapshot& snap);

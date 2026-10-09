@@ -36,6 +36,10 @@ int VR_IsHeadsetActive(void);
  *  when VR is not driving the possessed creature. */
 int VR_GetPossessionControls(int* yaw, int* pitch, int* move_x, int* move_y);
 
+/** Game thread: non-zero once after the controller's pause button was
+ *  pressed; the input code then toggles pause as for the pause key. */
+int VR_ConsumePauseRequest(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -27,7 +27,8 @@
 #include "creature_states_lair.h"  // creature_can_do_healing_sleep()
 #include "thing_creature.h"    // creature_is_invisible(), get_creature_lair_room(), thing_is_creature()
 #include "room_data.h"         // room_is_invalid()
-#include "custom_sprites.h"    // get_button_sprite(), get_button_sprite_for_player()
+#include "custom_sprites.h"    // get_button_sprite(), get_button_sprite_for_player(), get_panel_sprite()
+#include "config_spritecolors.h" // get_player_colored_icon_idx()
 #include "sprites.h"           // GBS_*
 #include "gui_draw.h"          // gui_blink_rate, neutral_flash_rate
 #include "player_instances.h"  // PLAYER_NEUTRAL
@@ -540,6 +541,61 @@ void add_thing(ThingSnapshot& snap, struct Thing* thing, int hand_slot)
 
 } // namespace
 
+void PickUpCreatureOfKind(int kind)
+{
+    pick_up_creature_of_model_and_gui_job(kind, CrGUIJob_Any, my_player_number, TPF_PickableCheck);
+}
+
+/** Makes sure the render thread gets @p spr's image; returns its cache id, or 0. */
+int32_t request_gui_sprite(ThingSnapshot& snap, const struct TbSprite* spr)
+{
+    if (spr == nullptr || spr->Data == nullptr || spr->SWidth == 0 || spr->SHeight == 0)
+        return 0;
+    const int32_t id = gui_sprite_id(spr);
+    if (s_sent_images.insert(id).second)
+    {
+        SpriteImage img;
+        img.id = id;
+        img.w = spr->SWidth;
+        img.h = spr->SHeight;
+        decode_sprite(img, spr->Data);
+        snap.new_images.push_back(std::move(img));
+    }
+    return id;
+}
+
+/** The palm menu: each creature type the player owns, with its panel icon
+ *  and count, the special digger first as in the creature tab. */
+void add_palm_menu(ThingSnapshot& snap)
+{
+    struct Dungeon* dungeon = get_my_dungeon();
+    if (dungeon_invalid(dungeon))
+        return;
+    auto add_kind = [&](int kind) {
+        if (kind <= 0 || kind >= game.conf.crtr_conf.model_count || dungeon->owned_creatures_of_model[kind] == 0)
+            return;
+        const long spr_idx = get_creature_model_graphics(kind, CGI_HandSymbol);
+        if (spr_idx <= 0)
+            return;
+        const int32_t id = request_gui_sprite(snap, get_panel_sprite(get_player_colored_icon_idx(spr_idx, my_player_number)));
+        if (id == 0)
+            return;
+        snap.palm.push_back({ id, kind, (int)dungeon->owned_creatures_of_model[kind] });
+    };
+    const int digger = get_players_special_digger_model(my_player_number);
+    add_kind(digger);
+    for (int kind = 1; kind < game.conf.crtr_conf.model_count && snap.palm.size() < 15; kind++)
+    {
+        if (kind != digger)
+            add_kind(kind);
+    }
+    const struct TbSprite* digit0 = get_button_sprite(GBS_fontchars_number_dig0);
+    if (digit0 != nullptr && digit0->SHeight > 0)
+        snap.digit_aspect = (float)digit0->SWidth / (float)digit0->SHeight;
+    for (int d = 0; d < 10; d++)
+        snap.digit_sprite[d] = request_gui_sprite(snap, get_button_sprite((short)(GBS_fontchars_number_dig0 + d)));
+}
+
 void GetPossessionView(PossessionView* out)
 {
     *out = PossessionView();
@@ -573,11 +629,13 @@ void UpdateThingSnapshot(ThingSnapshot& snap)
     }
     snap.sprites.clear();
     snap.selection.clear();
+    snap.palm.clear();
 
     struct PlayerInfo* player = get_my_player();
     if (player == nullptr || game.map_subtiles_x <= 0 || game.map_subtiles_y <= 0)
         return;
     add_selection(snap, player);
+    add_palm_menu(snap);
 
     for (MapSubtlCoord stl_y = 0; stl_y < game.map_subtiles_y; stl_y++)
     {

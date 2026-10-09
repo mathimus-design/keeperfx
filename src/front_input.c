@@ -989,7 +989,18 @@ static short get_global_inputs(void)
     {
 
         TbBool toggle_pause = is_game_key_pressed(Gkey_TogglePause, true, false);
-        
+        // The VR menu button pauses and opens the options window (settings,
+        // save / load, quit), which is hard to find from the headset otherwise;
+        // pressed again it closes the window and resumes.
+        if (VR_ConsumePauseRequest())
+        {
+            if ((game.operation_flags & GOF_Paused) != 0)
+                turn_off_all_window_menus();
+            else
+                turn_on_menu(GMnu_OPTIONS);
+            toggle_pause = true;
+        }
+
         if (is_game_key_pressed(Gkey_PauseMenu, true, false))
         {
             TbBool active_menu_closed = false;

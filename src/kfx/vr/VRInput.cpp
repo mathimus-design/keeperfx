@@ -15,7 +15,10 @@
 #include "player_data.h"     // local_state.engine_window_*
 #include "bflib_video.h"     // lbDisplay, pixel_size
 #include "bflib_mouse.h"     // LbMouseSetPositionInitial()
-#include "frontend.h"        // status_panel_width
+#include "frontend.h"        // status_panel_width, menu_is_active(), active_buttons[]
+#include "bflib_guibtns.h"   // struct GuiButton, LbBtnF_*
+#include "gui_frontmenu.h"   // GMnu_*, get_active_menu(), menu_id_to_number()
+#include "frontmenu_ingame_evnt.h" // my_visible_event_idx
 #include "game_legacy.h"     // game.operation_flags, GOF_ShowGui
 #include "config_players.h"  // get_player_state_stats(), PsPg_Spell, PSt_*
 #include "packets.h"         // set_players_packet_action(), PckA_SetPlyrState
@@ -175,9 +178,33 @@ void ReturnToHand()
         set_players_packet_action(player, PckA_SetPlyrState, PSt_CtrlDungeon, 0, 0, 0);
 }
 
+int PlayerWorkState()
+{
+    // The state plus which room / power / trap / door is chosen, so switching
+    // from one room (or spell...) to another counts as a change too.
+    struct PlayerInfo* player = get_my_player();
+    const struct UserState* ustate = get_local_user_state();
+    if (player == nullptr || ustate == nullptr)
+        return 0;
+    uint32_t tool = player->work_state;
+    tool = tool * 31u + ustate->chosen_room_kind;
+    tool = tool * 31u + (uint32_t)ustate->chosen_power_kind;
+    tool = tool * 31u + (uint32_t)ustate->chosen_trap_kind;
+    tool = tool * 31u + (uint32_t)ustate->chosen_door_kind;
+    return (int)tool;
+}
+
+bool PlainHand()
+{
+    struct PlayerInfo* player = get_my_player();
+    return player != nullptr && player->work_state == PSt_CtrlDungeon;
+}
+
 bool MenuScreenWanted(bool in_level)
 {
-    return !in_level || a_menu_window_is_active();
+    // Paused too: the screen shows the game's pause display, and its menus
+    // (options, quit) can be reached from it.
+    return !in_level || a_menu_window_is_active() || (game.operation_flags & GOF_Paused) != 0;
 }
 
 void ApplyMenuTouch(const MenuInput& in)
@@ -186,6 +213,64 @@ void ApplyMenuTouch(const MenuInput& in)
     {
         move_game_cursor((long)(in.u * lbDisplay.GraphicsScreenWidth),
                          (long)((1.0f - in.v) * lbDisplay.GraphicsScreenHeight));
+    }
+    const bool press = in.valid && in.press;
+    if (press != s_left_down)
+    {
+        s_left_down = press;
+        set_left_button(press);
+    }
+}
+
+void GetInfoBox(InfoBoxInfo* out)
+{
+    *out = InfoBoxInfo();
+    if ((game.operation_flags & GOF_ShowGui) == 0 || lbDisplay.GraphicsScreenWidth <= 0 || lbDisplay.GraphicsScreenHeight <= 0)
+        return;
+    static const short boxes[] = { GMnu_TEXT_INFO, GMnu_BATTLE, GMnu_DUNGEON_SPECIAL, GMnu_SPELL_LOST };
+    for (short id : boxes)
+    {
+        if (!menu_is_active(id))
+            continue;
+        const struct GuiMenu* gmnu = get_active_menu(menu_id_to_number(id));
+        if (gmnu == nullptr || gmnu->width <= 0 || gmnu->height <= 0)
+            continue;
+        const float sw = (float)lbDisplay.GraphicsScreenWidth, sh = (float)lbDisplay.GraphicsScreenHeight;
+        out->visible = true;
+        out->x0 = (float)gmnu->pos_x / sw;
+        out->y0 = (float)gmnu->pos_y / sh;
+        out->x1 = (float)(gmnu->pos_x + gmnu->width) / sw;
+        out->y1 = (float)(gmnu->pos_y + gmnu->height) / sh;
+        // Which message: the event the text box shows, told apart per box kind.
+        out->message_id = (int)id * 1000 + (int)my_visible_event_idx;
+        // Its small clickable buttons, left to right as the game lays them out;
+        // big ones (the text area itself) are skipped.
+        const int menu_num = menu_id_to_number(id);
+        for (int i = 0; i < ACTIVE_BUTTONS_COUNT && out->button_count < 6; i++)
+        {
+            const struct GuiButton* gbtn = &active_buttons[i];
+            if ((gbtn->flags & (LbBtnF_Active | LbBtnF_Visible)) != (LbBtnF_Active | LbBtnF_Visible)
+                || gbtn->gmenu_idx != menu_num || gbtn->click_event == nullptr)
+                continue;
+            if (gbtn->width <= 0 || gbtn->height <= 0 || gbtn->width > gmnu->width / 3 || gbtn->height > gmnu->height / 2)
+                continue;
+            InfoBoxInfo::Button& b = out->buttons[out->button_count++];
+            b.x0 = (float)gbtn->scr_pos_x / sw;
+            b.y0 = (float)gbtn->scr_pos_y / sh;
+            b.x1 = (float)(gbtn->scr_pos_x + gbtn->width) / sw;
+            b.y1 = (float)(gbtn->scr_pos_y + gbtn->height) / sh;
+        }
+        return;
+    }
+}
+
+void ApplyInfoTouch(const MenuInput& in, const InfoBoxInfo& box)
+{
+    if (in.valid && box.visible)
+    {
+        const float x = box.x0 + in.u * (box.x1 - box.x0);
+        const float y = box.y0 + (1.0f - in.v) * (box.y1 - box.y0);
+        move_game_cursor((long)(x * lbDisplay.GraphicsScreenWidth), (long)(y * lbDisplay.GraphicsScreenHeight));
     }
     const bool press = in.valid && in.press;
     if (press != s_left_down)

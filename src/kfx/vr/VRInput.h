@@ -67,12 +67,38 @@ bool PossessChosen();
  *  does (drops a chosen spell). */
 void ReturnToHand();
 
+/** Game thread: a value for the chosen tool (player state plus the chosen
+ *  room / spell / trap / door), which changes whenever one is picked; and
+ *  whether the player has the plain hand. */
+int PlayerWorkState();
+bool PlainHand();
+
 /** Game thread: true while the game shows a menu rather than the dungeon:
- *  the frontend (main menu, campaign map, ...) or a menu window in a level. */
+ *  the frontend (main menu, campaign map, ...), a menu window in a level, or
+ *  the game paused. */
 bool MenuScreenWanted(bool in_level);
 
 /** Game thread: moves the game's cursor to the touched spot and presses the
  *  left button while touching. */
 void ApplyMenuTouch(const MenuInput& in);
+
+/** Game thread -> render thread: the message box (objective / info text,
+ *  battle and special boxes) the desktop shows over the dungeon view. */
+struct InfoBoxInfo {
+    bool visible = false;
+    float x0 = 0, y0 = 0, x1 = 0, y1 = 0;   /**< Screen fractions, y from the top. */
+    int message_id = 0;                      /**< Changes when a different message is shown. */
+    /** The box's own small buttons (close tick, zoom-to eye, scroll), which
+     *  VR repeats in a row under the box where they are easier to reach. */
+    struct Button { float x0, y0, x1, y1; } buttons[6];
+    int button_count = 0;
+};
+
+/** Game thread: where the message box is, if one is open. */
+void GetInfoBox(InfoBoxInfo* out);
+
+/** Game thread: a touch on the message box copy; u/v are within the box (they
+ *  may fall outside 0..1 for a button the game draws outside it). */
+void ApplyInfoTouch(const MenuInput& in, const InfoBoxInfo& box);
 
 } // namespace VR
