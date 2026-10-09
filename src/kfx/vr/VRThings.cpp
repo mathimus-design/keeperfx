@@ -19,9 +19,26 @@
 #include "engine_render.h"     // resolve_keepersprite_draw_data(), interpolate_thing()
 #include "player_data.h"       // my_player_number, get_my_player()
 #include "dungeon_data.h"      // get_my_dungeon(), things_in_hand
+#include "creature_control.h"  // struct CreatureControl, creature_control_get_from_thing()
+#include "config_creature.h"   // creature_stats_get_from_thing(), get_creature_model_flags(), CMF_*
+#include "creature_states.h"   // creature_is_being_unconscious()
+#include "creature_states_combt.h" // creature_would_benefit_from_healing()
+#include "creature_states_lair.h"  // creature_can_do_healing_sleep()
+#include "thing_creature.h"    // creature_is_invisible(), get_creature_lair_room(), thing_is_creature()
+#include "room_data.h"         // room_is_invalid()
+#include "custom_sprites.h"    // get_button_sprite(), get_button_sprite_for_player()
+#include "sprites.h"           // GBS_*
+#include "gui_draw.h"          // gui_blink_rate, neutral_flash_rate
+#include "player_instances.h"  // PLAYER_NEUTRAL
+#include "keeperfx.hpp"        // MFlg_NoHeroHealthFlower
+#include "kfx/renderer/RendererManager.h" // RendererGetDrawFlags()
 #include <cmath>
 #include <unordered_set>
 #include "post_inc.h"
+
+/* engine_render.c; not in a header. */
+extern "C" void fill_status_sprite_indexes(struct Thing *thing, struct CreatureControl *cctrl, short *health_spridx,
+                                           short *state_spridx, short *anger_spridx);
 
 namespace VR {
 
@@ -83,6 +100,157 @@ bool should_draw(const struct Thing* thing, const struct PlayerInfo* player)
             return false;
     }
     return true;
+}
+
+/** Cache id for a GUI sprite: they are not keeper sprites, so keep them in
+ *  their own id range, keyed by the sprite (they stay loaded for the level). */
+int32_t gui_sprite_id(const struct TbSprite* spr)
+{
+    return (int32_t)(0x40000000u | (uint32_t)(((uintptr_t)spr >> 3) & 0x3FFFFFFFu));
+}
+
+/** Adds an upright, full-brightness GUI sprite above a creature. */
+void add_status_layer(ThingSnapshot& snap, const struct TbSprite* spr, float x, float y, float z,
+                      float unit, int16_t one_colour, uint8_t blend, float lift)
+{
+    if (spr == nullptr || spr->Data == nullptr || spr->SWidth == 0 || spr->SHeight == 0)
+        return;
+    const int32_t id = gui_sprite_id(spr);
+    if (s_sent_images.insert(id).second)
+    {
+        SpriteImage img;
+        img.id = id;
+        img.w = spr->SWidth;
+        img.h = spr->SHeight;
+        decode_sprite(img, spr->Data);
+        snap.new_images.push_back(std::move(img));
+    }
+    SpriteBillboard b = {};
+    b.x = x;
+    b.y = y;
+    b.z = z;
+    b.left = -0.5f * spr->SWidth * unit;
+    b.right = 0.5f * spr->SWidth * unit;
+    b.bottom = 0.0f;
+    b.top = spr->SHeight * unit;
+    b.stl_x = b.stl_y = -1.0f;  // full brightness, as on the desktop
+    b.sprite_id = id;
+    b.blend = blend;
+    b.kind = SK_Upright;
+    b.one_colour = one_colour;
+    b.lift = lift;
+    snap.sprites.push_back(b);
+}
+
+/** The health flower, level and thought bubble above a creature. Mirrors
+ *  draw_status_sprites() (which also decides when each is shown), placed in
+ *  the world above the creature's head as add_draw_status_box() does. */
+void add_status(ThingSnapshot& snap, struct Thing* thing, float px, float py, float pz)
+{
+    struct PlayerInfo* player = get_my_player();
+    struct CreatureControl* cctrl = creature_control_get_from_thing(thing);
+    if (creature_control_invalid(cctrl))
+        return;
+    if (cctrl->force_health_flower_hidden || flag_is_set(get_creature_model_flags(thing), CMF_NoHealthFlower))
+        return;
+    if (flag_is_set(game.mode_flags, MFlg_NoHeroHealthFlower))
+    {
+        if (local_state.local_thing_under_hand != thing->index)
+        {
+            cctrl->thought_bubble_last_turn_drawn = get_gameturn();
+            if (!cctrl->force_health_flower_displayed)
+                return;
+        }
+        cctrl->thought_bubble_display_timer = 40;
+    }
+
+    short health_spridx = 0, state_spridx = 0, anger_spridx = 0;
+    const unsigned short draw_flags = RendererGetDrawFlags();  // fill_status_sprite_indexes() sets some
+    fill_status_sprite_indexes(thing, cctrl, &health_spridx, &state_spridx, &anger_spridx);
+    RendererSetDrawFlags(draw_flags);
+    const int exp_level = (cctrl->exp_level < 9) ? cctrl->exp_level : 9;
+
+    // Height above the creature, as add_draw_status_box() works it out.
+    const struct CreatureModelConfig* crconf = creature_stats_get_from_thing(thing);
+    long offset = thing->clipbox_size_z + crconf->status_offset;
+    offset += (offset * game.conf.crtr_conf.exp.size_increase_on_exp * cctrl->exp_level) / 100;
+    const float z = pz + (float)offset;
+
+    // GUI sprite pixels to game units: the level flower is about two thirds of a subtile wide.
+    const struct TbSprite* level_spr = get_button_sprite(GBS_creature_flower_level_01 + exp_level);
+    if (level_spr == nullptr || level_spr->SWidth == 0)
+        return;
+    const float unit = 170.0f / (float)level_spr->SWidth;
+    const int blink = (gui_blink_rate > 0) ? gui_blink_rate : 1;
+    const GameTurn turn = get_gameturn();
+
+    // Each layer is nudged a little further towards the viewer so stacked
+    // icons do not fight over the same depth.
+    float lift = 4.0f;
+    float raise = 0.0f;
+    if (state_spridx || anger_spridx)
+    {
+        add_status_layer(snap, get_button_sprite(GBS_creature_states_cloud), px, py, z, unit, -1,
+                         is_my_player_number(thing->owner) ? 1 : 0, lift);
+        lift += 4.0f;
+    }
+    if (((turn % (8 * blink)) < 4 * (GameTurn)blink) && (anger_spridx > 0))
+    {
+        add_status_layer(snap, get_button_sprite(anger_spridx), px, py, z, unit, -1, 0, lift);
+        lift += 4.0f;
+        if (state_spridx)
+        {
+            const struct TbSprite* spr = get_button_sprite_for_player(state_spridx, thing->owner);
+            if (spr != nullptr)
+                raise += spr->SHeight * unit;
+        }
+    }
+    else if (state_spridx)
+    {
+        const struct TbSprite* spr = get_button_sprite_for_player(state_spridx, thing->owner);
+        add_status_layer(snap, spr, px, py, z, unit, -1, 0, lift);
+        lift += 4.0f;
+        if (spr != nullptr)
+            raise += spr->SHeight * unit;
+    }
+
+    if ((thing->lair.spr_size > 0) && (health_spridx > 0) && ((turn % (2 * blink)) >= (GameTurn)blink))
+    {
+        // Flashing in the owner's colour.
+        int flash_color = get_player_color_idx(thing->owner);
+        if (flash_color == PLAYER_NEUTRAL)
+            flash_color = (int)((turn % (4 * neutral_flash_rate)) / neutral_flash_rate);
+        add_status_layer(snap, get_button_sprite_for_player(health_spridx, thing->owner), px, py, z + raise, unit,
+                         (int16_t)player_flash_colours[flash_color], 0, lift);
+        return;
+    }
+
+    const TbBool is_under_hand = (local_state.local_thing_under_hand == thing->index);
+    const TbBool is_enemy_and_visible = players_are_enemies(player->id_number, thing->owner) && !creature_is_invisible(thing);
+    TbBool is_owned_and_hurt = false;
+    TbBool is_allied = false;
+    TbBool should_drag_to_lair = false;
+    if (!is_enemy_and_visible)
+    {
+        is_owned_and_hurt = creature_would_benefit_from_healing(thing) && !creature_is_being_unconscious(thing)
+                         && (player->id_number == thing->owner);
+        is_allied = players_are_mutual_allies(player->id_number, thing->owner) && (player->id_number != thing->owner);
+        should_drag_to_lair = creature_is_being_unconscious(thing) && (player->id_number == thing->owner)
+            && ((game.conf.rules[thing->owner].workers.drag_to_lair == 1 && !room_is_invalid(get_creature_lair_room(thing)))
+             || (game.conf.rules[thing->owner].workers.drag_to_lair == 2 && creature_can_do_healing_sleep(thing)));
+    }
+    const TbBool is_zombie_player = !flag_is_set(get_player(thing->owner)->allocflags, PlaF_Allocated);
+    if (cctrl->force_health_flower_displayed || is_under_hand || is_enemy_and_visible || is_owned_and_hurt
+        || is_allied || is_zombie_player || (thing->owner == PLAYER_NEUTRAL) || should_drag_to_lair
+        || (cctrl->combat_flags != 0) || (thing->lair.spr_size > 0))
+    {
+        if (health_spridx > 0)
+        {
+            add_status_layer(snap, get_button_sprite_for_player(health_spridx, thing->owner), px, py, z + raise, unit, -1, 0, lift);
+            lift += 4.0f;
+        }
+        add_status_layer(snap, level_spr, px, py, z + raise, unit, -1, 0, lift);
+    }
 }
 
 /** @param hand_slot -1 for a thing on the map, else its place in the Keeper's hand. */
@@ -158,6 +326,9 @@ void add_thing(ThingSnapshot& snap, struct Thing* thing, int hand_slot)
     b.hand_slot = in_hand ? (uint8_t)hand_slot : 0;
     b.sprite_id = draw_idx;
     b.flip = flip ? 1 : 0;
+    b.kind = SK_Upright;
+    b.one_colour = -1;
+    b.lift = 0.0f;
     switch (thing->rendering_flags & TRF_Transpar_Flags)
     {
     case TRF_Transpar_8:
@@ -172,6 +343,25 @@ void add_thing(ThingSnapshot& snap, struct Thing* thing, int hand_slot)
         break;
     }
     snap.sprites.push_back(b);
+
+    if (!in_hand && thing_is_creature(thing))
+    {
+        // A soft shadow on the floor, under creatures that cast one.
+        if ((base->frame_flags & FFL_NoShadows) == 0 && (thing->movement_flags & TMvF_BeingSacrificed) == 0)
+        {
+            SpriteBillboard shadow = b;
+            const float radius = std::fmax(40.0f, 0.45f * (b.right - b.left));
+            shadow.kind = SK_Shadow;
+            shadow.z = (float)interp.floor_height + 3.0f;  // just above the floor, at any jump height
+            shadow.left = -radius;
+            shadow.right = radius;
+            shadow.bottom = -radius * 0.75f;
+            shadow.top = radius * 0.75f;
+            shadow.blend = 0;
+            snap.sprites.push_back(shadow);
+        }
+        add_status(snap, thing, px, py, pz);
+    }
 }
 
 } // namespace

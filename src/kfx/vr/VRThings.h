@@ -29,6 +29,14 @@ struct SpriteBillboard {
     uint8_t blend;          /**< 0 opaque, 1 half transparent, 2 additive. */
     uint8_t in_hand;        /**< Held by the Keeper: drawn at the controller, not at x/y/z. */
     uint8_t hand_slot;      /**< Position in the hand, 0 = dropped next. */
+    uint8_t kind;           /**< SpriteKind. */
+    int16_t one_colour;     /**< Palette index to fill the sprite with (flashing flower), -1 for none. */
+    float lift;             /**< Moved this far towards the viewer, to stack layered icons. */
+};
+
+enum SpriteKind : uint8_t {
+    SK_Upright = 0,  /**< A standing billboard facing the viewer. */
+    SK_Shadow  = 1,  /**< A soft round shadow flat on the floor; left/right/bottom/top are its radii. */
 };
 
 /** A decoded sprite frame: per pixel a palette index and a coverage byte. */

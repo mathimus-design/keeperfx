@@ -280,12 +280,24 @@ uniform sampler2D u_palette;
 uniform sampler2D u_fade_table;  // 256x64 palette fade rows
 uniform int       u_use_fade;
 uniform float     u_alpha;
+uniform int       u_shadow;      // 1: soft round shadow, no texture
+uniform float     u_one_colour;  // >= 0: fill covered pixels with this palette index (0..1)
 out vec4 fragColor;
 void main()
 {
+    if (u_shadow != 0)
+    {
+        float d = length(v_uv * 2.0 - 1.0);
+        if (d >= 1.0)
+            discard;
+        fragColor = vec4(0.0, 0.0, 0.0, 0.5 * (1.0 - d * d));
+        return;
+    }
     vec2 ic = texture(u_sprite, v_uv).rg;
     if (ic.g < 0.5)
         discard;
+    if (u_one_colour >= 0.0)
+        ic.r = u_one_colour;
     vec3 col;
     if (u_use_fade != 0)
     {
@@ -455,7 +467,7 @@ struct State {
     GLuint lit_cube_vao = 0, lit_cube_vbo = 0;   // unit cube with face normals
     GLuint sprite_prog = 0;
     GLint loc_sprite_mvp = -1, loc_sprite_stride = -1, loc_sprite_min_shade = -1;
-    GLint loc_sprite_use_fade = -1, loc_sprite_alpha = -1;
+    GLint loc_sprite_use_fade = -1, loc_sprite_alpha = -1, loc_sprite_shadow = -1, loc_sprite_one_colour = -1;
     GLuint sprite_vao = 0, sprite_vbo = 0;
     std::unordered_map<int32_t, GLuint> sprite_textures;  // sprite id -> RG8 texture
 
@@ -662,6 +674,8 @@ bool create_gl_resources()
     s.loc_sprite_min_shade = glGetUniformLocation(s.sprite_prog, "u_min_shade");
     s.loc_sprite_use_fade  = glGetUniformLocation(s.sprite_prog, "u_use_fade");
     s.loc_sprite_alpha     = glGetUniformLocation(s.sprite_prog, "u_alpha");
+    s.loc_sprite_shadow    = glGetUniformLocation(s.sprite_prog, "u_shadow");
+    s.loc_sprite_one_colour = glGetUniformLocation(s.sprite_prog, "u_one_colour");
 
     glGenVertexArrays(1, &s.sprite_vao);
     glGenBuffers(1, &s.sprite_vbo);
@@ -1499,6 +1513,20 @@ void build_sprite_vertices(Vec3 viewer)
             b.x += rx * spread - fx * 8.0f * (float)b.hand_slot;
             b.y += ry * spread - fy * 8.0f * (float)b.hand_slot;
         }
+        if (b.kind == SK_Shadow)
+        {
+            // Flat on the floor, an ellipse along the map axes.
+            const SpriteVertex a = { b.x + b.left,  b.y + b.bottom, b.z, 0.0f, 0.0f, -1.0f, -1.0f };
+            const SpriteVertex c = { b.x + b.right, b.y + b.bottom, b.z, 1.0f, 0.0f, -1.0f, -1.0f };
+            const SpriteVertex d = { b.x + b.right, b.y + b.top,    b.z, 1.0f, 1.0f, -1.0f, -1.0f };
+            const SpriteVertex e = { b.x + b.left,  b.y + b.top,    b.z, 0.0f, 1.0f, -1.0f, -1.0f };
+            s_sprite_verts.push_back(a); s_sprite_verts.push_back(c); s_sprite_verts.push_back(d);
+            s_sprite_verts.push_back(d); s_sprite_verts.push_back(e); s_sprite_verts.push_back(a);
+            continue;
+        }
+        // Layered icons sit slightly in front of each other.
+        b.x += fx * b.lift;
+        b.y += fy * b.lift;
         const float u0 = b.flip ? 1.0f : 0.0f, u1 = 1.0f - u0;
         const SpriteVertex tl = { b.x + rx * b.left,  b.y + ry * b.left,  b.z + b.top,    u0, 0.0f, b.stl_x, b.stl_y };
         const SpriteVertex tr = { b.x + rx * b.right, b.y + ry * b.right, b.z + b.top,    u1, 0.0f, b.stl_x, b.stl_y };
@@ -1527,11 +1555,13 @@ void draw_sprites(const Mat4& mvp, const GLWorldViewRenderer::VRTextures& tex)
     glBindVertexArray(s.sprite_vao);
     glActiveTexture(GL_TEXTURE0);
 
-    // Opaque first, then half transparent (ghosts), then additive (glows),
-    // the last two without writing depth so they never hide what is behind.
-    for (int pass = 0; pass < 3; pass++)
+    // Opaque sprites first, then the floor shadows, then half transparent
+    // (ghosts, own creatures' thought clouds), then additive (glows). All but
+    // the first leave depth alone so they never hide what is behind them.
+    enum { PassOpaque, PassShadows, PassHalf, PassAdditive, PassCount };
+    for (int pass = 0; pass < PassCount; pass++)
     {
-        if (pass == 0)
+        if (pass == PassOpaque)
         {
             glDisable(GL_BLEND);
             glUniform1f(s.loc_sprite_alpha, 1.0f);
@@ -1540,24 +1570,37 @@ void draw_sprites(const Mat4& mvp, const GLWorldViewRenderer::VRTextures& tex)
         {
             glEnable(GL_BLEND);
             glDepthMask(GL_FALSE);
-            if (pass == 1)
-                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-            else
+            if (pass == PassAdditive)
                 glBlendFunc(GL_ONE, GL_ONE);
-            glUniform1f(s.loc_sprite_alpha, pass == 1 ? 0.5f : 1.0f);
+            else
+                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            glUniform1f(s.loc_sprite_alpha, pass == PassHalf ? 0.5f : 1.0f);
         }
+        glUniform1i(s.loc_sprite_shadow, pass == PassShadows ? 1 : 0);
         for (size_t i = 0; i < s_things.sprites.size(); i++)
         {
             const SpriteBillboard& b = s_things.sprites[i];
-            if (b.blend != pass)
+            if (pass == PassShadows)
+            {
+                if (b.kind != SK_Shadow)
+                    continue;
+                glDrawArrays(GL_TRIANGLES, (GLint)(i * 6), 6);
+                continue;
+            }
+            if (b.kind != SK_Upright)
+                continue;
+            const int wanted = (b.blend == 0) ? PassOpaque : (b.blend == 1) ? PassHalf : PassAdditive;
+            if (wanted != pass)
                 continue;
             const auto it = s.sprite_textures.find(b.sprite_id);
             if (it == s.sprite_textures.end())
                 continue;
+            glUniform1f(s.loc_sprite_one_colour, b.one_colour >= 0 ? (float)b.one_colour / 255.0f : -1.0f);
             glBindTexture(GL_TEXTURE_2D, it->second);
             glDrawArrays(GL_TRIANGLES, (GLint)(i * 6), 6);
         }
     }
+    glUniform1i(s.loc_sprite_shadow, 0);
     glDisable(GL_BLEND);
     glDepthMask(GL_TRUE);
     glBindTexture(GL_TEXTURE_2D, 0);
