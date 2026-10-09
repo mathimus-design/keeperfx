@@ -2893,6 +2893,18 @@ static void get_creature_control_nonaction_inputs(void)
     }
     // packet stores creature's absolute facing angle
     look_local_first_person_camera(thing, pckt->pos_x, pckt->pos_y, &pckt->pos_x, &pckt->pos_y);
+    // In VR the creature faces where the headset looks, and the left
+    // thumbstick moves it.
+    int vr_yaw, vr_pitch, vr_move_x, vr_move_y;
+    const TbBool vr_controls = thing_is_creature(thing)
+        && VR_GetPossessionControls(&vr_yaw, &vr_pitch, &vr_move_x, &vr_move_y);
+    if (vr_controls)
+    {
+        pckt->pos_x = vr_yaw;
+        pckt->pos_y = vr_pitch;
+        local_state.camera.first_person_look_yaw = vr_yaw;
+        local_state.camera.first_person_look_pitch = vr_pitch;
+    }
     // Now do user actions
     if (thing_is_creature(thing))
     {
@@ -2932,6 +2944,18 @@ static void get_creature_control_nonaction_inputs(void)
         else if (creature_movement_accum_y <= -1.0f) {
             set_packet_control(packet, PCtr_MoveUp);
             creature_movement_accum_y = 0.0f;
+        }
+        if (vr_controls)
+        {
+            // The stick acts like the movement keys, held while pushed.
+            if (vr_move_y > 40)
+                set_packet_control(packet, PCtr_MoveUp);
+            else if (vr_move_y < -40)
+                set_packet_control(packet, PCtr_MoveDown);
+            if (vr_move_x > 40)
+                set_packet_control(packet, PCtr_MoveRight);
+            else if (vr_move_x < -40)
+                set_packet_control(packet, PCtr_MoveLeft);
         }
         
         if (flag_is_set(thing->movement_flags, TMvF_Flying))

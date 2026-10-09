@@ -30,6 +30,12 @@ int VR_GetSoundListener(int* x, int* y, int* z, int* angle);
  *  steers the game's cursor). */
 int VR_IsHeadsetActive(void);
 
+/** Game thread, while possessing a creature: the facing the headset asks for
+ *  (yaw and pitch in game angle units, as the first-person packet carries
+ *  them) and the left thumbstick (-100..100, x right, y forward). Returns 0
+ *  when VR is not driving the possessed creature. */
+int VR_GetPossessionControls(int* yaw, int* pitch, int* move_x, int* move_y);
+
 #ifdef __cplusplus
 }
 #endif

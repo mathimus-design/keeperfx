@@ -18,6 +18,7 @@
 #include "engine_arrays.h"     // get_render_animation_sprite()
 #include "engine_render.h"     // resolve_keepersprite_draw_data(), interpolate_thing()
 #include "player_data.h"       // my_player_number, get_my_player()
+#include "local_camera.h"      // get_local_view_type()
 #include "dungeon_data.h"      // get_my_dungeon(), things_in_hand
 #include "creature_control.h"  // struct CreatureControl, creature_control_get_from_thing()
 #include "config_creature.h"   // creature_stats_get_from_thing(), get_creature_model_flags(), CMF_*
@@ -539,6 +540,29 @@ void add_thing(ThingSnapshot& snap, struct Thing* thing, int hand_slot)
 
 } // namespace
 
+void GetPossessionView(PossessionView* out)
+{
+    *out = PossessionView();
+    struct PlayerInfo* player = get_my_player();
+    if (player == nullptr)
+        return;
+    const unsigned char view = get_local_view_type(player);
+    if (view != PVT_CreatureContrl && view != PVT_CreaturePasngr)
+        return;
+    struct Thing* creature = thing_get(player->controlled_thing_idx);
+    if (!thing_exists(creature) || !thing_is_creature(creature))
+        return;
+    const struct ThingInterpolateResult interp = interpolate_thing(creature);
+    out->active = true;
+    out->controlling = (view == PVT_CreatureContrl);
+    out->eye_x = (float)interp.mappos.x.val;
+    out->eye_y = (float)interp.mappos.y.val;
+    out->eye_z = (float)(interp.mappos.z.val + get_creature_eye_height(creature));
+    out->yaw = creature->move_angle_xy & ANGLE_MASK;
+    out->thing_idx = creature->index;
+    out->digger = thing_is_creature_digger(creature);
+}
+
 void UpdateThingSnapshot(ThingSnapshot& snap)
 {
     if (snap.reset_cache)
@@ -570,7 +594,7 @@ void UpdateThingSnapshot(ThingSnapshot& snap)
                 if (thing_is_invalid(thing))
                     break;
                 i = thing->next_on_mapblk;
-                if ((thing->rendering_flags & TRF_Invisible) != 0)
+                if ((thing->rendering_flags & TRF_Invisible) != 0 || thing->index == snap.hide_thing)
                     continue;
                 if (thing->draw_class == ODC_RoomPrice)
                     add_price(snap, thing);

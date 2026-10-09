@@ -383,8 +383,11 @@ void main() { fragColor = u_color; }
 
 constexpr float k_near = 0.02f;
 constexpr float k_far  = 50.0f;
-/** Default size: one subtile is 1.2 cm, so a full 85x85 slab map is about 3 m wide. */
-constexpr float k_default_scale = 0.012f / 256.0f;
+/** Default size: one subtile is 3 cm (a slab 9 cm), so the rooms around the
+ *  Dungeon Heart fill the view; grip with both hands to see more of the map. */
+constexpr float k_default_scale = 0.03f / 256.0f;
+/** Possession: the dungeon at life size around the creature, 70 cm a subtile. */
+constexpr float k_fp_scale = 0.7f / 256.0f;
 constexpr float k_min_scale = 0.002f / 256.0f;
 constexpr float k_max_scale = 0.25f / 256.0f;
 constexpr float k_grab_on  = 0.60f;
@@ -446,7 +449,23 @@ struct State {
     XrAction panel_toggle_action = XR_NULL_HANDLE;
     XrAction scroll_action = XR_NULL_HANDLE;    // left thumbstick
     float scroll_x = 0, scroll_y = 0;           // its current deflection
+    XrAction turn_action = XR_NULL_HANDLE;      // right thumbstick
+    float turn_x = 0;                           // its sideways deflection
     Vec3 head_forward = {0, 0, -1};             // horizontal, from the last rendered frame
+    // Possession: life size, with the creature's eyes where the player's head
+    // was when it began, turned so the creature faced the way the player did.
+    bool possessing = false;
+    bool fp_reanchor = false;                   // recenter pressed while possessing
+    Vec3 fp_anchor = {0, 0, 0};
+    float fp_yaw = 0;
+    Vec3 fp_eye = {0, 0, 0};                    // game units
+    Vec3 last_head = {0, 0, 0};                 // head position of the last rendered frame
+    float frame_dt = 0;                         // seconds, this frame
+    // Pickaxe swing detection (possessing a digger).
+    bool swing_have_last = false;
+    Vec3 swing_last_head = {0, 0, 0};
+    float swing_cooldown = 0;
+    int swing_click_frames = 0;
     bool ray_valid = false;                     // the pointing ray from the right hand
     bool ray_forward = false;                   // forward along the controller, else out of the palm
     Vec3 ray_origin = {0, 0, 0}, ray_dir = {0, 0, -1};
@@ -528,6 +547,19 @@ struct HeadInput {
     float dx = 0, dy = 0, dz = 0;
 };
 HeadInput s_head_in;
+
+/** The possessed creature (game -> render). */
+PossessionView s_possession;
+
+/** What the headset asks of the possessed creature (render -> game), and the
+ *  game thread's own copy that the input code reads between frames. */
+struct PossessionLook {
+    bool valid = false;
+    int yaw = 0, pitch = 0;
+    int move_x = 0, move_y = 0;
+};
+PossessionLook s_look;
+PossessionLook s_look_game;
 
 /** Sound listener, worked out and read on the game thread only. */
 struct Listener {
@@ -848,7 +880,8 @@ bool create_actions()
         !make_action(XR_ACTION_TYPE_FLOAT_INPUT, "select", "Pick up / dig (left click)", true, &s.select_action) ||
         !make_action(XR_ACTION_TYPE_BOOLEAN_INPUT, "hand_action", "Drop / slap (right click)", true, &s.hand_action) ||
         !make_action(XR_ACTION_TYPE_BOOLEAN_INPUT, "toggle_panel", "Show / hide the wrist panel", false, &s.panel_toggle_action) ||
-        !make_action(XR_ACTION_TYPE_VECTOR2F_INPUT, "scroll", "Scroll the dungeon", false, &s.scroll_action))
+        !make_action(XR_ACTION_TYPE_VECTOR2F_INPUT, "scroll", "Scroll the dungeon", false, &s.scroll_action) ||
+        !make_action(XR_ACTION_TYPE_VECTOR2F_INPUT, "turn", "Turn (possessing)", false, &s.turn_action))
         return false;
 
     const char* const profiles[] = {
@@ -870,6 +903,7 @@ bool create_actions()
             {s.hand_action,     to_path("/user/hand/right/input/a/click")},
             {s.panel_toggle_action, to_path("/user/hand/left/input/thumbstick/click")},
             {s.scroll_action,   to_path("/user/hand/left/input/thumbstick")},
+            {s.turn_action,     to_path("/user/hand/right/input/thumbstick")},
         };
         XrInteractionProfileSuggestedBinding suggested = {XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
         suggested.interactionProfile = to_path(profile);
@@ -1005,8 +1039,8 @@ void destroy_xr()
     s.action_set = XR_NULL_HANDLE;
     s.pose_action = s.grip_action = s.recenter_action = XR_NULL_HANDLE;
     s.aim_action = s.select_action = s.hand_action = s.panel_toggle_action = XR_NULL_HANDLE;
-    s.scroll_action = XR_NULL_HANDLE;
-    s.scroll_x = s.scroll_y = 0.0f;
+    s.scroll_action = s.turn_action = XR_NULL_HANDLE;
+    s.scroll_x = s.scroll_y = s.turn_x = 0.0f;
     s.hand_spaces[0] = s.hand_spaces[1] = XR_NULL_HANDLE;
     s.aim_spaces[0] = s.aim_spaces[1] = XR_NULL_HANDLE;
     for (Hand& hand : s.hands)
@@ -1282,14 +1316,34 @@ void poll_events()
 
 /** Dungeon tabletop: game units -> reference space. The focus point sits at
  *  table_pos; game x runs right, game y (south) towards the player, game z up. */
+/** Where the dungeon is in the reference space: the game point @c focus sits
+ *  at @c pos, turned by @c yaw and scaled by @c scale (metres per game unit).
+ *  Either the tabletop, or life size around the possessed creature's eyes. */
+struct WorldPlacement {
+    Vec3 pos;
+    float yaw;
+    float scale;
+    Vec3 focus;   // game units: x, y on the map, z up
+};
+
+WorldPlacement world_placement()
+{
+    if (s.possessing)
+        return { s.fp_anchor, s.fp_yaw, k_fp_scale, s.fp_eye };
+    return { s.table_pos, s.table_yaw, s.table_scale, {s.table_focus_x, s.table_focus_y, 0.0f} };
+}
+
+/** Game units -> reference space. Game x runs right, game y (south)
+ *  towards the player, game z up. */
 Mat4 table_model()
 {
+    const WorldPlacement w = world_placement();
     Mat4 swizzle = Mat4::Identity();
     swizzle.m[5] = 0.0f; swizzle.m[6] = 1.0f;   // game y -> +Z
     swizzle.m[9] = 1.0f; swizzle.m[10] = 0.0f;  // game z -> +Y
-    return Mat4::Translation(s.table_pos) * Mat4::RotationY(s.table_yaw)
-         * Mat4::Scale({s.table_scale, s.table_scale, s.table_scale}) * swizzle
-         * Mat4::Translation({-s.table_focus_x, -s.table_focus_y, 0.0f});
+    return Mat4::Translation(w.pos) * Mat4::RotationY(w.yaw)
+         * Mat4::Scale({w.scale, w.scale, w.scale}) * swizzle
+         * Mat4::Translation({-w.focus.x, -w.focus.y, -w.focus.z});
 }
 
 /** Puts the dungeon about half a metre in front of the head and a bit below
@@ -1391,8 +1445,27 @@ void update_table_scroll(float dt)
     s.table_pos = s.table_pos - move;
 }
 
+/** Right thumbstick while possessing: smooth turning. The dungeon turns
+ *  around the head (so the head keeps its place in it), and with it the way
+ *  the creature faces, which follows the head. */
+void update_possession_turn(float dt)
+{
+    constexpr float k_deadzone = 0.2f;
+    constexpr float k_turn_speed = 2.1f;  // radians per second at full deflection (about 120 degrees)
+    const float mag = std::fabs(s.turn_x);
+    if (mag <= k_deadzone || dt <= 0.0f)
+        return;
+    const float eased = (mag - k_deadzone) / (1.0f - k_deadzone);
+    // Pushing right turns right: the world turns the other way around the head.
+    const float delta = (s.turn_x > 0.0f ? 1.0f : -1.0f) * eased * eased * k_turn_speed * dt;
+    const Vec3 pivot = s.last_head;
+    s.fp_anchor = pivot + RotateY(s.fp_anchor - pivot, delta);
+    s.fp_yaw += delta;
+}
+
 void update_input(XrTime time, float dt)
 {
+    s.frame_dt = dt;
     for (Hand& hand : s.hands)
     {
         hand.tracked = false;
@@ -1450,7 +1523,12 @@ void update_input(XrTime time, float dt)
     XrActionStateBoolean recenter = {XR_TYPE_ACTION_STATE_BOOLEAN};
     if (XR_SUCCEEDED(xrGetActionStateBoolean(s.session, &get, &recenter)) &&
         recenter.isActive && recenter.changedSinceLastSync && recenter.currentState)
-        s.table_placed = false;
+    {
+        if (s.possessing)
+            s.fp_reanchor = true;   // put the creature's eyes back at the head
+        else
+            s.table_placed = false;
+    }
 
     get.action = s.panel_toggle_action;
     XrActionStateBoolean toggle = {XR_TYPE_ACTION_STATE_BOOLEAN};
@@ -1465,23 +1543,80 @@ void update_input(XrTime time, float dt)
         s.scroll_x = stick.currentState.x;
         s.scroll_y = stick.currentState.y;
     }
+    get.action = s.turn_action;
+    XrActionStateVector2f turn = {XR_TYPE_ACTION_STATE_VECTOR2F};
+    if (XR_SUCCEEDED(xrGetActionStateVector2f(s.session, &get, &turn)) && turn.isActive)
+        s.turn_x = turn.currentState.x;
 
-    update_table_grab();
-    update_table_scroll(dt);
+    // While possessing, the left stick walks the creature (see
+    // update_possession()), the right one turns, and the table stays where it
+    // was for when the player leaves it.
+    if (s.possessing)
+    {
+        update_possession_turn(dt);
+    }
+    else
+    {
+        update_table_grab();
+        update_table_scroll(dt);
+    }
+}
+
+/** Possession: switches between the table and the creature's eyes, and turns
+ *  the head's direction into the facing the creature should take. */
+void update_possession(Vec3 head, Vec3 gaze)
+{
+    const bool was_possessing = s.possessing;
+    s.possessing = s_possession.active;
+    if (!s.possessing || !s_possession.digger || !was_possessing)
+        s.swing_have_last = false;  // no stale pickaxe position across possessions
+    if (!s.possessing)
+    {
+        s_look.valid = false;
+        return;
+    }
+    s.fp_eye = { s_possession.eye_x, s_possession.eye_y, s_possession.eye_z };
+    const float flat = std::sqrt(gaze.x * gaze.x + gaze.z * gaze.z);
+    if (!was_possessing || s.fp_reanchor)
+    {
+        // Put the creature's eyes at the head, facing the way the head faces.
+        s.fp_reanchor = false;
+        s.fp_anchor = head;
+        const float a = (float)s_possession.yaw * 3.14159265f / 1024.0f;
+        const Vec3 creature_fwd = { std::sin(a), 0.0f, -std::cos(a) };  // game (x, y) on the local x/z plane
+        const Vec3 head_fwd = (flat > 0.1f) ? Vec3{gaze.x, 0.0f, gaze.z} : Vec3{0.0f, 0.0f, -1.0f};
+        s.fp_yaw = Heading(head_fwd) - Heading(creature_fwd);
+    }
+
+    // Head direction in game terms: yaw from the horizontal part, pitch from
+    // how far up or down it looks (the game allows about +-40 degrees).
+    const Vec3 local = RotateY(gaze, -s.fp_yaw);
+    PossessionLook look;
+    look.valid = flat > 0.1f;
+    look.yaw = (int)(LbArcTanAngle((int32_t)(local.x * 10000.0f), (int32_t)(local.z * 10000.0f)) & ANGLE_MASK);
+    const float up = std::fmax(-1.0f, std::fmin(1.0f, gaze.y));
+    int pitch = (int)std::lround(std::asin(up) * 1024.0f / 3.14159265f);
+    pitch = (pitch > 227) ? 227 : (pitch < -227) ? -227 : pitch;
+    look.pitch = pitch & ANGLE_MASK;
+    look.move_x = (int)(s.scroll_x * 100.0f);
+    look.move_y = (int)(s.scroll_y * 100.0f);
+    s_look = look;
 }
 
 /** Game units -> reference space; same as table_model() applied to a point. */
 Vec3 game_to_stage(Vec3 g)
 {
-    const Vec3 local = { (g.x - s.table_focus_x) * s.table_scale, g.z * s.table_scale, (g.y - s.table_focus_y) * s.table_scale };
-    return RotateY(local, s.table_yaw) + s.table_pos;
+    const WorldPlacement w = world_placement();
+    const Vec3 local = { (g.x - w.focus.x) * w.scale, (g.z - w.focus.z) * w.scale, (g.y - w.focus.y) * w.scale };
+    return RotateY(local, w.yaw) + w.pos;
 }
 
 /** Reference space -> game units; inverse of table_model(). */
 Vec3 stage_to_game(Vec3 p)
 {
-    const Vec3 q = RotateY(p - s.table_pos, -s.table_yaw) * (1.0f / s.table_scale);
-    return { q.x + s.table_focus_x, q.z + s.table_focus_y, q.y };
+    const WorldPlacement w = world_placement();
+    const Vec3 q = RotateY(p - w.pos, -w.yaw) * (1.0f / w.scale);
+    return { q.x + w.focus.x, q.z + w.focus.y, q.y + w.focus.z };
 }
 
 /** Builds this frame's sprite quads, each turned to face @p viewer (game units)
@@ -1728,6 +1863,90 @@ void draw_keeper_hand(const Mat4& view_proj, const Hand& hand)
     glBindVertexArray(0);
 }
 
+constexpr float k_pick_handle_len = 0.42f;
+
+/** The pickaxe's frame: at the fist, -Z up the handle. It is held nearly
+ *  upright (tilted about 75 degrees up from the controller's forward), and
+ *  the trigger tips it forward as if striking. */
+Mat4 pickaxe_frame(const Hand& hand)
+{
+    return Mat4::FromPose(hand.aim_tracked ? hand.aim_rot : hand.rot, hand.pos)
+         * Mat4::RotationX(1.3f - 1.1f * hand.trigger);
+}
+
+/** Centre of the pickaxe head, reference space. */
+Vec3 pickaxe_head(const Hand& hand)
+{
+    const Mat4 m = pickaxe_frame(hand);
+    const float z = 0.06f - k_pick_handle_len;
+    return { m.m[8] * z + m.m[12], m.m[9] * z + m.m[13], m.m[10] * z + m.m[14] };
+}
+
+/** A pickaxe in the right hand: the handle rises from the fist, the head
+ *  crosses it at the top with the point facing forward and a broader blade
+ *  behind. */
+void draw_pickaxe(const Mat4& view_proj, const Hand& hand)
+{
+    constexpr float wood[3]  = { 0.45f, 0.28f, 0.14f };
+    constexpr float iron[3]  = { 0.52f, 0.53f, 0.58f };
+    constexpr float strap[3] = { 0.28f, 0.17f, 0.09f };
+
+    glUseProgram(s.lit_prog);
+    const float light_len = std::sqrt(0.3f * 0.3f + 0.9f * 0.9f + 0.4f * 0.4f);
+    glUniform3f(s.loc_lit_light, 0.3f / light_len, 0.9f / light_len, 0.4f / light_len);
+    glBindVertexArray(s.lit_cube_vao);
+
+    const Mat4 grip = pickaxe_frame(hand);
+    // Handle, starting a little below the fist.
+    draw_lit_box(view_proj, grip * Mat4::Translation({0.0f, 0.0f, 0.06f - k_pick_handle_len * 0.5f})
+                            * Mat4::Scale({0.026f, 0.026f, k_pick_handle_len}), wood[0], wood[1], wood[2]);
+    // Fist-sized wrap where the hand holds it, and one under the head.
+    draw_lit_box(view_proj, grip * Mat4::Scale({0.032f, 0.032f, 0.07f}), strap[0], strap[1], strap[2]);
+    const Mat4 tip = grip * Mat4::Translation({0.0f, 0.0f, 0.06f - k_pick_handle_len});
+    draw_lit_box(view_proj, tip * Mat4::Translation({0.0f, 0.0f, 0.03f}) * Mat4::Scale({0.034f, 0.034f, 0.05f}),
+                 strap[0], strap[1], strap[2]);
+    // Head: in this frame -Y faces forward once the pickaxe is upright, so the
+    // point goes there and the blade on +Y. Both curve down towards the hand.
+    draw_lit_box(view_proj, tip * Mat4::Scale({0.036f, 0.07f, 0.05f}), iron[0], iron[1], iron[2]);
+    draw_lit_box(view_proj, tip * Mat4::Translation({0.0f, -0.075f, 0.008f}) * Mat4::RotationX(0.25f)
+                            * Mat4::Scale({0.024f, 0.09f, 0.032f}), iron[0], iron[1], iron[2]);
+    draw_lit_box(view_proj, tip * Mat4::Translation({0.0f, -0.135f, 0.03f}) * Mat4::RotationX(0.5f)
+                            * Mat4::Scale({0.014f, 0.05f, 0.018f}), iron[0], iron[1], iron[2]);
+    draw_lit_box(view_proj, tip * Mat4::Translation({0.0f, 0.075f, 0.008f}) * Mat4::RotationX(-0.25f)
+                            * Mat4::Scale({0.03f, 0.09f, 0.04f}), iron[0], iron[1], iron[2]);
+    draw_lit_box(view_proj, tip * Mat4::Translation({0.0f, 0.13f, 0.03f}) * Mat4::RotationX(-0.45f)
+                            * Mat4::Scale({0.022f, 0.04f, 0.05f}), iron[0], iron[1], iron[2]);
+    glBindVertexArray(0);
+}
+
+/** Swinging the pickaxe: true for a few frames after its head comes down fast
+ *  enough, which then counts as a click (dig / attack) like the trigger. */
+bool update_pickaxe_swing(const Hand& hand, float dt)
+{
+    constexpr float k_strike_speed = 2.2f;   // m/s downward at the head
+    constexpr float k_cooldown = 0.35f;      // s between strikes, so one swing is one strike
+    constexpr int k_click_frames = 4;        // long enough for the game to see the press
+    const Vec3 head = pickaxe_head(hand);
+    if (s.swing_have_last && dt > 0.0f)
+    {
+        const Vec3 v = (head - s.swing_last_head) * (1.0f / dt);
+        s.swing_cooldown -= dt;
+        if (s.swing_cooldown <= 0.0f && -v.y > k_strike_speed)
+        {
+            s.swing_click_frames = k_click_frames;
+            s.swing_cooldown = k_cooldown;
+        }
+    }
+    s.swing_last_head = head;
+    s.swing_have_last = true;
+    if (s.swing_click_frames > 0)
+    {
+        s.swing_click_frames--;
+        return true;
+    }
+    return false;
+}
+
 void draw_eye(const EyeTarget& eye, const Mat4& view_proj, const GLWorldViewRenderer::VRTextures& tex)
 {
     glViewport(0, 0, eye.w, eye.h);
@@ -1796,9 +2015,15 @@ void draw_eye(const EyeTarget& eye, const Mat4& view_proj, const GLWorldViewRend
         glBindTexture(GL_TEXTURE_2D_ARRAY, 0);
     }
 
-    // The Keeper's hand on the right controller.
+    // The Keeper's hand on the right controller, or a pickaxe while
+    // possessing an imp or other digger.
     if (s.hands[1].tracked)
-        draw_keeper_hand(view_proj, s.hands[1]);
+    {
+        if (s.possessing && s_possession.digger)
+            draw_pickaxe(view_proj, s.hands[1]);
+        else
+            draw_keeper_hand(view_proj, s.hands[1]);
+    }
 
     // Left controller marker: a small block, green while grabbing.
     glUseProgram(s.solid_prog);
@@ -1888,6 +2113,9 @@ bool render_views(GLWorldViewRenderer& world, XrTime time,
     // Sprites face the point between the eyes; the game thread also uses it
     // next frame to pick each creature's facing.
     const Vec3 head = (to_vec(views[0].pose.position) + to_vec(views[1].pose.position)) * 0.5f;
+    const Vec3 head_gaze = Rotate(to_quat(views[0].pose.orientation), {0, 0, -1});
+    s.last_head = head;
+    update_possession(head, head_gaze);
     const Vec3 viewer = stage_to_game(head);
     s_things.viewer_x = viewer.x;
     s_things.viewer_y = viewer.y;
@@ -1913,8 +2141,10 @@ bool render_views(GLWorldViewRenderer& world, XrTime time,
     // for clicking the panel. With it closed it comes straight out of the
     // palm of the Keeper's hand (turned like the aim pose, palm towards -X),
     // so a palm-down hand points down at what is under it.
-    s.panel_shown = !s.panel_hidden && s.in_level && place_panel(head);
-    s.ray_valid = pointer.aim_tracked && pointer.tracked;
+    // While possessing there is no ray or panel; the buttons still go through
+    // (trigger attacks, A leaves the creature).
+    s.panel_shown = !s.panel_hidden && s.in_level && !s.possessing && place_panel(head);
+    s.ray_valid = pointer.aim_tracked && pointer.tracked && !s.possessing;
     s.ray_forward = s.panel_shown;
     if (s.ray_valid && s.ray_forward)
     {
@@ -1938,6 +2168,17 @@ bool render_views(GLWorldViewRenderer& world, XrTime time,
         if (s_select_held ? (pointer.trigger < 0.35f) : (pointer.trigger > 0.6f))
             s_select_held = !s_select_held;
         in.select = s_select_held;
+        in.action = pointer.action;
+    }
+    else if (s.possessing && s.in_level)
+    {
+        in.valid = true;
+        in.buttons_only = true;
+        if (s_select_held ? (pointer.trigger < 0.35f) : (pointer.trigger > 0.6f))
+            s_select_held = !s_select_held;
+        // A digger also strikes with a real swing of the pickaxe.
+        const bool swing = s_possession.digger && pointer.tracked && update_pickaxe_swing(pointer, s.frame_dt);
+        in.select = s_select_held || swing;
         in.action = pointer.action;
     }
     else
@@ -2024,6 +2265,10 @@ void GameThreadSync()
     UpdateDungeonSnapshot(s_snapshot);
     if (s_snapshot.in_level)
     {
+        GetPossessionView(&s_possession);
+        s_things.hide_thing = s_possession.active ? s_possession.thing_idx : 0;
+        s_look_game = s_look;
+        s_look_game.valid = s_look.valid && s_possession.active && s_possession.controlling;
         UpdateThingSnapshot(s_things);
         ApplyPointer(s_pointer_in, &s_pointer_out);
         GetPanelInfo(&s_panel_info);
@@ -2056,6 +2301,8 @@ void GameThreadSync()
         s_things.sprites.clear();
         s_pointer_out.hit = false;
         s_listener.valid = false;
+        s_possession = PossessionView();
+        s_look_game.valid = false;
     }
 }
 
@@ -2168,6 +2415,17 @@ int VR_GetSoundListener(int* x, int* y, int* z, int* angle)
     return 1;
 }
 
+int VR_GetPossessionControls(int* yaw, int* pitch, int* move_x, int* move_y)
+{
+    if (!vr_requested || !VR::s_look_game.valid)
+        return 0;
+    *yaw = VR::s_look_game.yaw;
+    *pitch = VR::s_look_game.pitch;
+    *move_x = VR::s_look_game.move_x;
+    *move_y = VR::s_look_game.move_y;
+    return 1;
+}
+
 int VR_IsHeadsetActive(void)
 {
     // The listener is worked out each frame the headset renders the dungeon.
@@ -2185,6 +2443,7 @@ void RenderThreadShutdown() {}
 
 int VR_GetSoundListener(int*, int*, int*, int*) { return 0; }
 int VR_IsHeadsetActive(void) { return 0; }
+int VR_GetPossessionControls(int*, int*, int*, int*) { return 0; }
 
 #include "post_inc.h"
 

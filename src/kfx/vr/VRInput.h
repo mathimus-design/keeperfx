@@ -23,6 +23,7 @@ struct PointerInput {
     float dx = 0, dy = 0, dz = 0;    /**< Ray direction, game units. */
     bool select = false;             /**< Held: acts as the left mouse button. */
     bool action = false;             /**< Held: acts as the right mouse button. */
+    bool buttons_only = false;       /**< Possessing: pass the buttons on, but there is no ray. */
     bool panel_hit = false;          /**< The ray is on the wrist panel instead of the dungeon. */
     float panel_u = 0, panel_v = 0;  /**< Where on the panel: 0..1 left to right, bottom to top. */
 };

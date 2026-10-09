@@ -65,7 +65,22 @@ struct ThingSnapshot {
     bool viewer_valid = false;
     float viewer_x = 0, viewer_y = 0;        /**< Headset position in game units, for sprite facing. */
     bool reset_cache = false;                /**< Render thread lost its textures; resend all images. */
+    // Game thread's own setting
+    int hide_thing = 0;                      /**< Thing not to draw: the possessed creature, seen from inside. */
 };
+
+/** The creature the player is possessing (or riding along with), seen from its eyes. */
+struct PossessionView {
+    bool active = false;
+    bool controlling = false;   /**< False when only riding along (passenger mode). */
+    bool digger = false;        /**< An imp or other digger: the hand becomes a pickaxe. */
+    float eye_x = 0, eye_y = 0, eye_z = 0;  /**< Game units. */
+    int yaw = 0;                /**< Its facing, game angle units. */
+    int thing_idx = 0;
+};
+
+/** Game thread: fill @p out from the local player's view. */
+void GetPossessionView(PossessionView* out);
 
 /** Game thread: refresh @p snap from the map's things. */
 void UpdateThingSnapshot(ThingSnapshot& snap);

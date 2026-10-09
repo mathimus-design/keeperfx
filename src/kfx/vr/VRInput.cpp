@@ -98,7 +98,12 @@ void ApplyPointer(const PointerInput& in, PointerResult* out)
 {
     out->hit = false;
     MapHit hit;
-    if (in.valid && in.panel_hit && panel_visible())
+    if (in.buttons_only)
+    {
+        // Possessing: the game keeps its cursor centred and turns the creature
+        // from the headset; only the buttons are needed.
+    }
+    else if (in.valid && in.panel_hit && panel_visible())
     {
         // On the wrist panel: put the game's cursor on the same spot of the
         // real side panel, so its buttons see the clicks.
