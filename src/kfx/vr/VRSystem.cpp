@@ -447,7 +447,8 @@ struct State {
     XrAction scroll_action = XR_NULL_HANDLE;    // left thumbstick
     float scroll_x = 0, scroll_y = 0;           // its current deflection
     Vec3 head_forward = {0, 0, -1};             // horizontal, from the last rendered frame
-    bool ray_valid = false;                     // the pointing ray, out of the right palm
+    bool ray_valid = false;                     // the pointing ray from the right hand
+    bool ray_forward = false;                   // forward along the controller, else out of the palm
     Vec3 ray_origin = {0, 0, 0}, ray_dir = {0, 0, -1};
     XrPath hand_paths[2] = {XR_NULL_PATH, XR_NULL_PATH};
     XrSpace hand_spaces[2] = {XR_NULL_HANDLE, XR_NULL_HANDLE};
@@ -1620,6 +1621,36 @@ void draw_sprites(const Mat4& mvp, const GLWorldViewRenderer::VRTextures& tex)
     glBindVertexArray(0);
 }
 
+/** The room / dig selection: a see-through tint over each slab, gold where it
+ *  can be built or dug, red where it cannot. @p mvp maps game units. */
+void draw_selection(const Mat4& mvp)
+{
+    if (s_things.selection.empty())
+        return;
+    glUseProgram(s.solid_prog);
+    glBindVertexArray(s.cube_vao);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glDepthMask(GL_FALSE);
+    for (const SelectionTile& t : s_things.selection)
+    {
+        // A thin slab-sized plate just above the surface, inset a little so
+        // neighbouring tiles show their edges.
+        constexpr float k_inset = 10.0f;
+        const Mat4 m = mvp * Mat4::Translation({(t.x0 + t.x1) * 0.5f, (t.y0 + t.y1) * 0.5f, t.z + 6.0f})
+                     * Mat4::Scale({t.x1 - t.x0 - 2.0f * k_inset, t.y1 - t.y0 - 2.0f * k_inset, 8.0f});
+        glUniformMatrix4fv(s.loc_solid_mvp, 1, GL_FALSE, m.m);
+        if (t.valid)
+            glUniform4f(s.loc_solid_color, 0.95f, 0.80f, 0.25f, 0.30f);
+        else
+            glUniform4f(s.loc_solid_color, 0.90f, 0.15f, 0.10f, 0.35f);
+        glDrawArrays(GL_TRIANGLES, 0, 36);
+    }
+    glDepthMask(GL_TRUE);
+    glDisable(GL_BLEND);
+    glBindVertexArray(0);
+}
+
 void draw_lit_box(const Mat4& view_proj, const Mat4& model, float r, float g, float b)
 {
     const Mat4 mvp = view_proj * model;
@@ -1753,6 +1784,7 @@ void draw_eye(const EyeTarget& eye, const Mat4& view_proj, const GLWorldViewRend
         glBindTexture(GL_TEXTURE_2D_ARRAY, 0);
 
         draw_sprites(mvp, tex);
+        draw_selection(mvp);
 
         glActiveTexture(GL_TEXTURE3);
         glBindTexture(GL_TEXTURE_2D, 0);
@@ -1812,9 +1844,12 @@ void draw_eye(const EyeTarget& eye, const Mat4& view_proj, const GLWorldViewRend
         if (ends)
             length = Length(hit_stage - s.ray_origin);
         const float glow = s_pointer_in.select ? 1.0f : 0.6f;
-        // Along the hand's -X (out of the palm), see render_views().
-        const Mat4 ray = view_proj * Mat4::FromPose(pointer.aim_rot, s.ray_origin)
-                       * Mat4::Translation({-length * 0.5f, 0, 0}) * Mat4::Scale({length, 0.003f, 0.003f});
+        // Along the hand's -Z (forward) or -X (out of the palm), see render_views().
+        const Mat4 ray = s.ray_forward
+            ? view_proj * Mat4::FromPose(pointer.aim_rot, s.ray_origin)
+                  * Mat4::Translation({0, 0, -length * 0.5f}) * Mat4::Scale({0.003f, 0.003f, length})
+            : view_proj * Mat4::FromPose(pointer.aim_rot, s.ray_origin)
+                  * Mat4::Translation({-length * 0.5f, 0, 0}) * Mat4::Scale({length, 0.003f, 0.003f});
         glUniformMatrix4fv(s.loc_solid_mvp, 1, GL_FALSE, ray.m);
         glUniform4f(s.loc_solid_color, 0.9f * glow, 0.25f * glow, 0.15f * glow, 1.0f);
         glDrawArrays(GL_TRIANGLES, 0, 36);
@@ -1874,16 +1909,23 @@ bool render_views(GLWorldViewRenderer& world, XrTime time,
     // The right controller's pointing ray, in game units, for the game thread.
     const Hand& pointer = s.hands[1];
     PointerInput in;
-    // The ray comes straight out of the palm of the Keeper's hand (turned like
-    // the aim pose, palm towards -X), so a palm-down hand points straight down
-    // at what is under it, without bending the wrist.
+    // With the wrist panel open the ray points forward along the controller,
+    // for clicking the panel. With it closed it comes straight out of the
+    // palm of the Keeper's hand (turned like the aim pose, palm towards -X),
+    // so a palm-down hand points down at what is under it.
+    s.panel_shown = !s.panel_hidden && s.in_level && place_panel(head);
     s.ray_valid = pointer.aim_tracked && pointer.tracked;
-    if (s.ray_valid)
+    s.ray_forward = s.panel_shown;
+    if (s.ray_valid && s.ray_forward)
+    {
+        s.ray_origin = pointer.aim_pos;
+        s.ray_dir = Rotate(pointer.aim_rot, {0.0f, 0.0f, -1.0f});
+    }
+    else if (s.ray_valid)
     {
         s.ray_origin = pointer.pos + Rotate(pointer.aim_rot, {0.022f, 0.0f, 0.004f});
         s.ray_dir = Rotate(pointer.aim_rot, {-1.0f, 0.0f, 0.0f});
     }
-    s.panel_shown = !s.panel_hidden && s.in_level && place_panel(head);
     if (s.ray_valid && s.panel_shown)
         in.panel_hit = ray_hits_panel(s.ray_origin, s.ray_dir, &in.panel_u, &in.panel_v, &s.panel_pointer);
     if (s.ray_valid && s.in_level)

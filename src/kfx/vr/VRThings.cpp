@@ -36,6 +36,11 @@
 #include "config_settings.h"   // settings.roomflags_on
 #include "config_terrain.h"    // room_can_have_ensign(), get_room_kind_stats()
 #include "config_magic.h"      // struct RoomConfigStats medsym_sprite_idx
+#include "roomspace.h"         // struct RoomSpace, MAX_ROOMSPACE_WIDTH
+#include "roomspace_prediction.h" // get_local_dig_prediction_render_roomspace()
+#include "frontend.h"          // game_is_busy_doing_gui()
+#include "map_columns.h"       // get_column(), get_map_column()
+#include "engine_arrays.h"     // floor_height_table[]
 #include <cmath>
 #include <unordered_set>
 #include "post_inc.h"
@@ -384,6 +389,43 @@ void add_room_flag(ThingSnapshot& snap, struct Thing* thing)
     }
 }
 
+/** The slabs of the box the desktop draws around the cursor while placing
+ *  rooms, selling or tagging for digging (process_isometric_map_volume_box()). */
+void add_selection(ThingSnapshot& snap, struct PlayerInfo* player)
+{
+    if (!map_volume_box.visible || game_is_busy_doing_gui())
+        return;
+    const struct RoomSpace* rs = get_local_dig_prediction_render_roomspace(&player->render_roomspace);
+    const int width = (rs->width < MAX_ROOMSPACE_WIDTH) ? rs->width : MAX_ROOMSPACE_WIDTH;
+    const int height = (rs->height < MAX_ROOMSPACE_WIDTH) ? rs->height : MAX_ROOMSPACE_WIDTH;
+    const struct Column* unrev = get_column(game.unrevealed_column_idx);
+    const float slab = (float)(STL_PER_SLB * COORD_PER_STL);
+    for (int y = 0; y < height; y++)
+    {
+        for (int x = 0; x < width; x++)
+        {
+            const bool valid = rs->slab_grid[x][y];
+            if (!valid && !rs->render_roomspace_as_box)
+                continue;  // the "automagic" shape shows only the slabs it covers
+            const MapSlabCoord slb_x = rs->left + x, slb_y = rs->top + y;
+            if (slb_x < 0 || slb_y < 0 || slb_x >= game.map_tiles_x || slb_y >= game.map_tiles_y)
+                continue;
+            // Sit on top of whatever the slab's middle subtile shows.
+            struct Map* mapblk = get_map_block_at(slab_subtile_center(slb_x), slab_subtile_center(slb_y));
+            const struct Column* col = map_block_revealed(mapblk, my_player_number) ? get_map_column(mapblk) : unrev;
+            long top = floor_height_table[col->solidmask];
+            SelectionTile t;
+            t.x0 = slb_x * slab;
+            t.y0 = slb_y * slab;
+            t.x1 = t.x0 + slab;
+            t.y1 = t.y0 + slab;
+            t.z = (float)(top * COORD_PER_STL);
+            t.valid = valid ? 1 : 0;
+            snap.selection.push_back(t);
+        }
+    }
+}
+
 /** @param hand_slot -1 for a thing on the map, else its place in the Keeper's hand. */
 void add_thing(ThingSnapshot& snap, struct Thing* thing, int hand_slot)
 {
@@ -506,10 +548,12 @@ void UpdateThingSnapshot(ThingSnapshot& snap)
         snap.reset_cache = false;
     }
     snap.sprites.clear();
+    snap.selection.clear();
 
     struct PlayerInfo* player = get_my_player();
     if (player == nullptr || game.map_subtiles_x <= 0 || game.map_subtiles_y <= 0)
         return;
+    add_selection(snap, player);
 
     for (MapSubtlCoord stl_y = 0; stl_y < game.map_subtiles_y; stl_y++)
     {

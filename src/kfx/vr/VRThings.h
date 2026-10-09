@@ -49,9 +49,17 @@ struct SpriteImage {
     std::vector<uint8_t> rg;  /**< w*h pairs of (palette index, coverage 0/255). */
 };
 
+/** One slab of the room / dig selection the cursor box shows. */
+struct SelectionTile {
+    float x0, y0, x1, y1;   /**< Slab extent, game units. */
+    float z;                /**< Top of what is there (floor or wall). */
+    uint8_t valid;          /**< 0: inside the box but cannot be built / dug. */
+};
+
 struct ThingSnapshot {
     // Game thread -> render thread
     std::vector<SpriteBillboard> sprites;    /**< This frame's things (replaced each frame). */
+    std::vector<SelectionTile> selection;    /**< The cursor box's slabs (replaced each frame). */
     std::vector<SpriteImage> new_images;     /**< Not yet uploaded; the render thread empties it. */
     // Render thread -> game thread
     bool viewer_valid = false;
