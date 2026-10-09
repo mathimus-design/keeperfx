@@ -468,6 +468,11 @@ struct State {
     int swing_click_frames = 0;
     bool ray_valid = false;                     // the pointing ray from the right hand
     bool ray_forward = false;                   // forward along the controller, else out of the palm
+    bool ray_left = false;                      // from the left hand, casting the chosen spell
+    float ray_palm_sign = -1.0f;                // palm ray along the hand's -X (right) or +X (left)
+    bool possess_was_chosen = false;            // Possess was chosen last frame
+    bool panel_auto_hidden = false;             // the panel folded away for Possess
+    Quat ray_rot = {0, 0, 0, 1};                // the ray hand's aim orientation
     Vec3 ray_origin = {0, 0, 0}, ray_dir = {0, 0, -1};
     XrPath hand_paths[2] = {XR_NULL_PATH, XR_NULL_PATH};
     XrSpace hand_spaces[2] = {XR_NULL_HANDLE, XR_NULL_HANDLE};
@@ -559,6 +564,10 @@ PanelInfo s_panel_info;
  *  the touch on it (render -> game). */
 bool s_menu_wanted = false;
 MenuInput s_menu_in;
+
+/** A spell is chosen and waiting to be cast, and whether it is Possess (game -> render). */
+bool s_spell_chosen = false;
+bool s_possess_chosen = false;
 
 /** Head position and gaze in game units (render -> game), for the sound listener. */
 struct HeadInput {
@@ -1637,6 +1646,23 @@ void update_possession_turn(float dt)
     s.fp_yaw += delta;
 }
 
+/** Right thumbstick at the table: turns it smoothly about the spot half a
+ *  metre in front of the head, so what is in front stays in reach while the
+ *  rest swings round. Same feel as update_possession_turn(). */
+void update_table_turn(float dt)
+{
+    constexpr float k_deadzone = 0.2f;
+    constexpr float k_turn_speed = 1.6f;  // radians per second at full deflection
+    const float mag = std::fabs(s.turn_x);
+    if (s.grab_mask != 0 || mag <= k_deadzone || dt <= 0.0f)
+        return;
+    const float eased = (mag - k_deadzone) / (1.0f - k_deadzone);
+    const float delta = (s.turn_x > 0.0f ? 1.0f : -1.0f) * eased * eased * k_turn_speed * dt;
+    const Vec3 pivot = s.last_head + s.head_forward * 0.5f;
+    s.table_pos = pivot + RotateY(s.table_pos - pivot, delta);
+    s.table_yaw += delta;
+}
+
 void update_input(XrTime time, float dt)
 {
     s.frame_dt = dt;
@@ -1710,7 +1736,10 @@ void update_input(XrTime time, float dt)
     XrActionStateBoolean toggle = {XR_TYPE_ACTION_STATE_BOOLEAN};
     if (XR_SUCCEEDED(xrGetActionStateBoolean(s.session, &get, &toggle)) &&
         toggle.isActive && toggle.changedSinceLastSync && toggle.currentState)
+    {
         s.panel_hidden = !s.panel_hidden;
+        s.panel_auto_hidden = false;  // the player decides from here
+    }
 
     get.action = s.scroll_action;
     XrActionStateVector2f stick = {XR_TYPE_ACTION_STATE_VECTOR2F};
@@ -1735,6 +1764,7 @@ void update_input(XrTime time, float dt)
     {
         update_table_grab();
         update_table_scroll(dt);
+        update_table_turn(dt);
     }
 }
 
@@ -2201,12 +2231,29 @@ void draw_eye(const EyeTarget& eye, const Mat4& view_proj, const GLWorldViewRend
             draw_keeper_hand(view_proj, s.hands[1]);
     }
 
-    // Left controller marker: a small block, green while grabbing.
+    // Left controller marker: a small block, green while grabbing. While a
+    // spell is ready to cast it is a glowing purple orb instead.
     glUseProgram(s.solid_prog);
     glBindVertexArray(s.cube_vao);
+    if (s.ray_left && s.hands[0].tracked)
+    {
+        const Hand& left = s.hands[0];
+        const float pulse = 0.75f + 0.25f * std::sin((float)s.frames_rendered * 0.15f);
+        // A few turning cubes read as a ball of light.
+        for (int k = 0; k < 3; k++)
+        {
+            const float spin = (float)s.frames_rendered * 0.04f + (float)k * 0.7f;
+            const float size = 0.045f * pulse * (1.0f - 0.18f * (float)k);
+            const Mat4 orb = view_proj * Mat4::Translation(left.pos + Vec3{0.0f, 0.03f, 0.0f})
+                           * Mat4::RotationY(spin) * Mat4::RotationX(spin * 0.7f) * Mat4::Scale({size, size, size});
+            glUniformMatrix4fv(s.loc_solid_mvp, 1, GL_FALSE, orb.m);
+            glUniform4f(s.loc_solid_color, 0.55f + 0.15f * k, 0.25f + 0.2f * k, 0.95f, 1.0f);
+            glDrawArrays(GL_TRIANGLES, 0, 36);
+        }
+    }
     for (const Hand& hand : s.hands)
     {
-        if (!hand.tracked || &hand == &s.hands[1])
+        if (!hand.tracked || &hand == &s.hands[1] || (s.ray_left && &hand == &s.hands[0]))
             continue;
         const Mat4 mvp = view_proj * Mat4::FromPose(hand.rot, hand.pos) * Mat4::Scale({0.03f, 0.03f, 0.09f});
         glUniformMatrix4fv(s.loc_solid_mvp, 1, GL_FALSE, mvp.m);
@@ -2265,9 +2312,9 @@ void draw_eye(const EyeTarget& eye, const Mat4& view_proj, const GLWorldViewRend
         glUseProgram(s.solid_prog);
     }
 
-    // Pointing ray from the right controller, ending in a marker where it meets
-    // the dungeon or the panel. Brighter while the trigger is held.
-    const Hand& pointer = s.hands[1];
+    // Pointing ray (right hand, or the left one casting a spell), ending in a
+    // marker where it meets the dungeon or the panel. Brighter while the
+    // trigger is held.
     if (s_pointer_in.valid && s.ray_valid)
     {
         float length = 2.0f;
@@ -2282,12 +2329,15 @@ void draw_eye(const EyeTarget& eye, const Mat4& view_proj, const GLWorldViewRend
         const float glow = s_pointer_in.select ? 1.0f : 0.6f;
         // Along the hand's -Z (forward) or -X (out of the palm), see render_views().
         const Mat4 ray = s.ray_forward
-            ? view_proj * Mat4::FromPose(pointer.aim_rot, s.ray_origin)
+            ? view_proj * Mat4::FromPose(s.ray_rot, s.ray_origin)
                   * Mat4::Translation({0, 0, -length * 0.5f}) * Mat4::Scale({0.003f, 0.003f, length})
-            : view_proj * Mat4::FromPose(pointer.aim_rot, s.ray_origin)
-                  * Mat4::Translation({-length * 0.5f, 0, 0}) * Mat4::Scale({length, 0.003f, 0.003f});
+            : view_proj * Mat4::FromPose(s.ray_rot, s.ray_origin)
+                  * Mat4::Translation({s.ray_palm_sign * length * 0.5f, 0, 0}) * Mat4::Scale({length, 0.003f, 0.003f});
         glUniformMatrix4fv(s.loc_solid_mvp, 1, GL_FALSE, ray.m);
-        glUniform4f(s.loc_solid_color, 0.9f * glow, 0.25f * glow, 0.15f * glow, 1.0f);
+        if (s.ray_left)
+            glUniform4f(s.loc_solid_color, 0.6f * glow, 0.3f * glow, 1.0f * glow, 1.0f);  // spell: purple
+        else
+            glUniform4f(s.loc_solid_color, 0.9f * glow, 0.25f * glow, 0.15f * glow, 1.0f);
         glDrawArrays(GL_TRIANGLES, 0, 36);
         if (ends)
         {
@@ -2360,6 +2410,20 @@ bool render_views(GLWorldViewRenderer& world, XrTime time,
     // for clicking the panel. With it closed it comes straight out of the
     // palm of the Keeper's hand (turned like the aim pose, palm towards -X),
     // so a palm-down hand points down at what is under it.
+    // Choosing Possess folds the wrist panel away, out of the way of the left
+    // hand; it comes back once that is over (cast, cancelled, or the creature left).
+    if (s_possess_chosen && !s.possess_was_chosen && !s.panel_hidden)
+    {
+        s.panel_hidden = true;
+        s.panel_auto_hidden = true;
+    }
+    if (!s_possess_chosen && !s.possessing && s.panel_auto_hidden)
+    {
+        s.panel_hidden = false;
+        s.panel_auto_hidden = false;
+    }
+    s.possess_was_chosen = s_possess_chosen;
+
     // While possessing there is no ray or panel; the buttons still go through
     // (trigger attacks, A leaves the creature).
     s.panel_shown = !s.panel_hidden && s.in_level && !s.possessing && place_panel(head);
@@ -2377,6 +2441,24 @@ bool render_views(GLWorldViewRenderer& world, XrTime time,
     }
     if (s.ray_valid && s.panel_shown)
         in.panel_hit = ray_hits_panel(s.ray_origin, s.ray_dir, &in.panel_u, &in.panel_v, &s.panel_pointer);
+    s.ray_rot = pointer.aim_rot;
+    // A spell is chosen: the left hand casts it, forward along the controller,
+    // with its own trigger; the right hand stays free for the panel (to pick
+    // another) and its A cancels, as right-click does.
+    const Hand& caster = s.hands[0];
+    s.ray_left = s_spell_chosen && !in.panel_hit && caster.aim_tracked && s.in_level && !s.possessing;
+    s.ray_palm_sign = -1.0f;  // a right palm faces -X
+    if (s.ray_left)
+    {
+        // Out of the left palm, which faces +X: palm down points down.
+        s.ray_valid = true;
+        s.ray_forward = false;
+        s.ray_palm_sign = 1.0f;
+        s.ray_origin = caster.pos + Rotate(caster.aim_rot, {-0.022f, 0.0f, 0.004f});
+        s.ray_dir = Rotate(caster.aim_rot, {1.0f, 0.0f, 0.0f});
+        s.ray_rot = caster.aim_rot;
+    }
+    const Hand& ray_hand = s.ray_left ? caster : pointer;
     if (s.ray_valid && s.in_level)
     {
         const Vec3 origin = stage_to_game(s.ray_origin);
@@ -2384,7 +2466,7 @@ bool render_views(GLWorldViewRenderer& world, XrTime time,
         in.valid = true;
         in.ox = origin.x; in.oy = origin.y; in.oz = origin.z;
         in.dx = ahead.x - origin.x; in.dy = ahead.y - origin.y; in.dz = ahead.z - origin.z;
-        if (s_select_held ? (pointer.trigger < 0.35f) : (pointer.trigger > 0.6f))
+        if (s_select_held ? (ray_hand.trigger < 0.35f) : (ray_hand.trigger > 0.6f))
             s_select_held = !s_select_held;
         in.select = s_select_held;
         in.action = pointer.action;
@@ -2493,7 +2575,22 @@ void GameThreadSync()
     s_menu_wanted = MenuScreenWanted(s_snapshot.in_level);
     if (s_snapshot.in_level)
     {
+        const bool was_possessing = s_possession.active;
         GetPossessionView(&s_possession);
+        // Leaving a creature: back to the plain hand (Possess would otherwise
+        // stay chosen, keeping the left hand casting). Sent for a few frames
+        // until the game has switched, in case other input that turn wins.
+        static int return_to_hand_frames = 0;
+        if (was_possessing && !s_possession.active)
+            return_to_hand_frames = 10;
+        if (return_to_hand_frames > 0)
+        {
+            return_to_hand_frames--;
+            if (SpellChosen())
+                ReturnToHand();
+            else
+                return_to_hand_frames = 0;
+        }
         s_things.hide_thing = s_possession.active ? s_possession.thing_idx : 0;
         s_look_game = s_look;
         s_look_game.valid = s_look.valid && s_possession.active && s_possession.controlling;
@@ -2503,6 +2600,8 @@ void GameThreadSync()
         else
             ApplyPointer(s_pointer_in, &s_pointer_out);
         GetPanelInfo(&s_panel_info);
+        s_spell_chosen = SpellChosen();
+        s_possess_chosen = PossessChosen();
 
         // Listen where the head looks at the table; straight below the head
         // if the gaze misses the map.
@@ -2534,6 +2633,8 @@ void GameThreadSync()
         s_listener.valid = false;
         s_possession = PossessionView();
         s_look_game.valid = false;
+        s_spell_chosen = false;
+        s_possess_chosen = false;
         ApplyMenuTouch(s_menu_in);  // frontend menus: main menu, campaign map, ...
     }
 }

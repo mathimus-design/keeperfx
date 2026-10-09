@@ -17,6 +17,8 @@
 #include "bflib_mouse.h"     // LbMouseSetPositionInitial()
 #include "frontend.h"        // status_panel_width
 #include "game_legacy.h"     // game.operation_flags, GOF_ShowGui
+#include "config_players.h"  // get_player_state_stats(), PsPg_Spell, PSt_*
+#include "packets.h"         // set_players_packet_action(), PckA_SetPlyrState
 #include "post_inc.h"
 
 namespace VR {
@@ -149,6 +151,28 @@ void ApplyPointer(const PointerInput& in, PointerResult* out)
         s_right_down = action;
         set_right_button(action);
     }
+}
+
+bool SpellChosen()
+{
+    struct PlayerInfo* player = get_my_player();
+    if (player == nullptr)
+        return false;
+    const struct PlayerStateConfigStats* plrst = get_player_state_stats(player->work_state);
+    return plrst != nullptr && plrst->pointer_group == PsPg_Spell;
+}
+
+bool PossessChosen()
+{
+    struct PlayerInfo* player = get_my_player();
+    return player != nullptr && (player->work_state == PSt_CtrlDirect || player->work_state == PSt_FreeCtrlDirect);
+}
+
+void ReturnToHand()
+{
+    struct PlayerInfo* player = get_my_player();
+    if (player != nullptr)
+        set_players_packet_action(player, PckA_SetPlyrState, PSt_CtrlDungeon, 0, 0, 0);
 }
 
 bool MenuScreenWanted(bool in_level)

@@ -56,6 +56,17 @@ struct MenuInput {
     bool press = false;              /**< Touching / trigger held: the left mouse button. */
 };
 
+/** Game thread: true while a spell is chosen and waiting to be cast (the
+ *  player state's cursor is the spell one); the left hand casts it then. */
+bool SpellChosen();
+
+/** Game thread: true while Possess is chosen and waiting for a creature. */
+bool PossessChosen();
+
+/** Game thread: back to the plain Keeper's hand, as the panel's hand button
+ *  does (drops a chosen spell). */
+void ReturnToHand();
+
 /** Game thread: true while the game shows a menu rather than the dungeon:
  *  the frontend (main menu, campaign map, ...) or a menu window in a level. */
 bool MenuScreenWanted(bool in_level);
