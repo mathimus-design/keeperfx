@@ -504,6 +504,21 @@ struct State {
     float panel_world_w = 0, panel_world_h = 0;  // metres
     Vec3 panel_pointer = {0, 0, 0};         // where the right ray meets the panel
 
+    // Menu screen: the whole desktop screen, floating within reach while a
+    // menu is up, touched with the index finger.
+    GLuint menu_tex = 0, menu_fbo = 0;
+    int menu_w = 0, menu_h = 0;
+    bool menu_ready = false;                // copied this frame
+    bool menu_shown = false;                // drawn this frame
+    bool menu_placed = false;               // placed since it last appeared
+    Vec3 menu_center = {0, 0, 0};
+    Vec3 menu_right = {1, 0, 0}, menu_up = {0, 1, 0}, menu_normal = {0, 0, 1};
+    float menu_world_w = 0, menu_world_h = 0;
+    bool menu_touching = false;             // finger pushed into the screen
+    bool menu_pointer_valid = false;        // finger or ray over the screen
+    Vec3 menu_pointer = {0, 0, 0};          // where, for the marker
+    bool menu_by_ray = false;               // the ray rather than the finger
+
     std::vector<Chunk> chunks;
     int chunks_x = 0, chunks_y = 0;
     bool in_level = false;
@@ -539,6 +554,11 @@ ThingSnapshot s_things;
 PointerInput s_pointer_in;
 PointerResult s_pointer_out;
 PanelInfo s_panel_info;
+
+/** The floating menu screen: whether the game wants it (game -> render) and
+ *  the touch on it (render -> game). */
+bool s_menu_wanted = false;
+MenuInput s_menu_in;
 
 /** Head position and gaze in game units (render -> game), for the sound listener. */
 struct HeadInput {
@@ -1069,6 +1089,11 @@ void destroy_gl()
     if (s.sprite_vao) glDeleteVertexArrays(1, &s.sprite_vao);
     if (s.sprite_prog) glDeleteProgram(s.sprite_prog);
     s.sprite_vbo = s.sprite_vao = s.sprite_prog = 0;
+    if (s.menu_fbo) glDeleteFramebuffers(1, &s.menu_fbo);
+    if (s.menu_tex) glDeleteTextures(1, &s.menu_tex);
+    s.menu_fbo = s.menu_tex = 0;
+    s.menu_w = s.menu_h = 0;
+    s.menu_ready = s.menu_placed = false;
     if (s.panel_fbo) glDeleteFramebuffers(1, &s.panel_fbo);
     if (s.panel_tex) glDeleteTextures(1, &s.panel_tex);
     if (s.panel_prog) glDeleteProgram(s.panel_prog);
@@ -1178,6 +1203,155 @@ Mat4 panel_model()
     m.m[8] = s.panel_normal.x; m.m[9] = s.panel_normal.y; m.m[10] = s.panel_normal.z;
     m.m[12] = s.panel_center.x; m.m[13] = s.panel_center.y; m.m[14] = s.panel_center.z;
     return m;
+}
+
+/** Copies the whole finished desktop frame into menu_tex. */
+void capture_menu(GLuint screen_fbo, int screen_w, int screen_h)
+{
+    s.menu_ready = false;
+    if (!s_menu_wanted || screen_fbo == 0 || screen_w <= 0 || screen_h <= 0)
+        return;
+    if (s.menu_tex == 0 || screen_w != s.menu_w || screen_h != s.menu_h)
+    {
+        if (s.menu_tex == 0) glGenTextures(1, &s.menu_tex);
+        if (s.menu_fbo == 0) glGenFramebuffers(1, &s.menu_fbo);
+        glBindTexture(GL_TEXTURE_2D, s.menu_tex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, screen_w, screen_h, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        glBindFramebuffer(GL_FRAMEBUFFER, s.menu_fbo);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, s.menu_tex, 0);
+        s.menu_w = screen_w;
+        s.menu_h = screen_h;
+    }
+    const GLboolean scissor = glIsEnabled(GL_SCISSOR_TEST);
+    glDisable(GL_SCISSOR_TEST);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, screen_fbo);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, s.menu_fbo);
+    glBlitFramebuffer(0, 0, screen_w, screen_h, 0, 0, screen_w, screen_h, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+    glBindFramebuffer(GL_FRAMEBUFFER, screen_fbo);
+    if (scissor)
+        glEnable(GL_SCISSOR_TEST);
+    s.menu_ready = true;
+}
+
+/** Puts the menu screen just within arm's reach in front of the head, a
+ *  little below eye level and tilted back to face it. Stays put until the
+ *  menu goes away (or recenter is pressed) so it can be reached. */
+void place_menu(Vec3 head, Vec3 gaze)
+{
+    constexpr float k_width = 0.62f;     // metres
+    constexpr float k_distance = 0.42f;  // in front of the head
+    Vec3 fwd = { gaze.x, 0.0f, gaze.z };
+    const float flat = Length(fwd);
+    fwd = (flat > 0.1f) ? fwd * (1.0f / flat) : Vec3{0.0f, 0.0f, -1.0f};
+    s.menu_world_w = k_width;
+    s.menu_world_h = k_width * (float)s.menu_h / (float)(s.menu_w > 0 ? s.menu_w : 1);
+    s.menu_center = head + fwd * k_distance + Vec3{0.0f, -0.12f, 0.0f};
+    // Face the head, as the wrist panel does.
+    Vec3 n = head - s.menu_center;
+    n = n * (1.0f / Length(n));
+    Vec3 right = { n.z, 0.0f, -n.x };
+    right = right * (1.0f / std::fmax(Length(right), 1e-4f));
+    s.menu_right = right;
+    s.menu_up = { n.y * right.z - n.z * right.y, n.z * right.x - n.x * right.z, n.x * right.y - n.y * right.x };
+    s.menu_normal = n;
+    s.menu_placed = true;
+}
+
+Mat4 menu_model()
+{
+    Mat4 m = Mat4::Identity();
+    const Vec3 r = s.menu_right * s.menu_world_w, u = s.menu_up * s.menu_world_h;
+    m.m[0] = r.x; m.m[1] = r.y; m.m[2] = r.z;
+    m.m[4] = u.x; m.m[5] = u.y; m.m[6] = u.z;
+    m.m[8] = s.menu_normal.x; m.m[9] = s.menu_normal.y; m.m[10] = s.menu_normal.z;
+    m.m[12] = s.menu_center.x; m.m[13] = s.menu_center.y; m.m[14] = s.menu_center.z;
+    return m;
+}
+
+/** Point on the menu screen: 0..1 coordinates (v up), and the distance in
+ *  front of it (negative once pushed through). False outside its edges. */
+bool menu_coords(Vec3 p, float* u, float* v, float* depth)
+{
+    const Vec3 d = p - s.menu_center;
+    *u = (d.x * s.menu_right.x + d.y * s.menu_right.y + d.z * s.menu_right.z) / s.menu_world_w + 0.5f;
+    *v = (d.x * s.menu_up.x + d.y * s.menu_up.y + d.z * s.menu_up.z) / s.menu_world_h + 0.5f;
+    *depth = d.x * s.menu_normal.x + d.y * s.menu_normal.y + d.z * s.menu_normal.z;
+    return *u >= 0.0f && *u <= 1.0f && *v >= 0.0f && *v <= 1.0f;
+}
+
+/** Tip of the Keeper's index finger, following draw_keeper_hand(). */
+Vec3 index_fingertip(const Hand& hand)
+{
+    const float segment_len[3] = { 0.040f, 0.026f, 0.020f };
+    const float joint_bend[3] = { 1.25f, 1.45f, 1.0f };
+    constexpr float k_rest_curl = 0.08f;
+    Mat4 m = Mat4::FromPose(hand.aim_tracked ? hand.aim_rot : hand.rot, hand.pos)
+           * Mat4::Translation({0.034f, 0.0f, 0.004f}) * Mat4::Translation({-0.002f, 0.027f, -0.042f});
+    for (int j = 0; j < 3; j++)
+        m = m * Mat4::RotationY(joint_bend[j] * hand.trigger + k_rest_curl) * Mat4::Translation({0.0f, 0.0f, -segment_len[j] * 0.95f});
+    return { m.m[12], m.m[13], m.m[14] };
+}
+
+/** Touch handling for the menu screen. The index fingertip pressing into the
+ *  screen clicks; hovering just in front moves the cursor. The forward ray
+ *  with the trigger works too, for out-of-reach spots. */
+MenuInput update_menu_touch(const Hand& hand)
+{
+    MenuInput in;
+    s.menu_pointer_valid = false;
+    s.menu_by_ray = false;
+    if (!s.menu_shown || !hand.tracked)
+    {
+        s.menu_touching = false;
+        return in;
+    }
+    constexpr float k_press_depth = 0.004f;    // pushed this far in front... or through: press
+    constexpr float k_release_depth = 0.015f;  // pulled back past this: release
+    constexpr float k_hover_depth = 0.12f;     // within this: cursor follows the finger
+    const Vec3 tip = index_fingertip(hand);
+    float u, v, depth;
+    if (menu_coords(tip, &u, &v, &depth) && depth < k_hover_depth && depth > -0.08f)
+    {
+        if (s.menu_touching ? (depth > k_release_depth) : (depth < k_press_depth))
+            s.menu_touching = !s.menu_touching;
+        in.valid = true;
+        in.u = u;
+        in.v = v;
+        in.press = s.menu_touching;
+        // Marker on the screen surface under the fingertip.
+        s.menu_pointer = s.menu_center + s.menu_right * ((u - 0.5f) * s.menu_world_w) + s.menu_up * ((v - 0.5f) * s.menu_world_h);
+        s.menu_pointer_valid = true;
+        return in;
+    }
+    s.menu_touching = false;
+
+    // Ray: forward along the controller, clicking with the trigger.
+    if (hand.aim_tracked)
+    {
+        const Vec3 dir = Rotate(hand.aim_rot, {0.0f, 0.0f, -1.0f});
+        const float denom = dir.x * s.menu_normal.x + dir.y * s.menu_normal.y + dir.z * s.menu_normal.z;
+        if (std::fabs(denom) > 1e-5f)
+        {
+            const Vec3 to_center = s.menu_center - hand.aim_pos;
+            const float t = (to_center.x * s.menu_normal.x + to_center.y * s.menu_normal.y + to_center.z * s.menu_normal.z) / denom;
+            if (t > 0.0f && menu_coords(hand.aim_pos + dir * t, &u, &v, &depth))
+            {
+                in.valid = true;
+                in.u = u;
+                in.v = v;
+                in.press = hand.trigger > 0.6f;
+                s.menu_pointer = hand.aim_pos + dir * t;
+                s.menu_pointer_valid = true;
+                s.menu_by_ray = true;
+            }
+        }
+    }
+    return in;
 }
 
 /** Uploads sprite images the game thread decoded. */
@@ -1524,7 +1698,9 @@ void update_input(XrTime time, float dt)
     if (XR_SUCCEEDED(xrGetActionStateBoolean(s.session, &get, &recenter)) &&
         recenter.isActive && recenter.changedSinceLastSync && recenter.currentState)
     {
-        if (s.possessing)
+        if (s.menu_shown)
+            s.menu_placed = false;  // bring the menu screen back in front
+        else if (s.possessing)
             s.fp_reanchor = true;   // put the creature's eyes back at the head
         else
             s.table_placed = false;
@@ -2041,6 +2217,41 @@ void draw_eye(const EyeTarget& eye, const Mat4& view_proj, const GLWorldViewRend
         glDrawArrays(GL_TRIANGLES, 0, 36);
     }
 
+    // Menu screen, with a marker where the finger or ray is on it.
+    if (s.menu_shown)
+    {
+        glUseProgram(s.panel_prog);
+        const Mat4 mvp = view_proj * menu_model();
+        glUniformMatrix4fv(s.loc_panel_mvp, 1, GL_FALSE, mvp.m);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, s.menu_tex);
+        glDrawArrays(GL_TRIANGLES, 0, 36);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        glUseProgram(s.solid_prog);
+        if (s.menu_pointer_valid)
+        {
+            const float size = s.menu_touching ? 0.008f : 0.005f;
+            const Mat4 dot = view_proj * Mat4::Translation(s.menu_pointer + s.menu_normal * 0.002f)
+                           * Mat4::Scale({size, size, size});
+            glUniformMatrix4fv(s.loc_solid_mvp, 1, GL_FALSE, dot.m);
+            if (s.menu_touching || (s.menu_by_ray && s.hands[1].trigger > 0.6f))
+                glUniform4f(s.loc_solid_color, 1.0f, 0.85f, 0.3f, 1.0f);
+            else
+                glUniform4f(s.loc_solid_color, 0.9f, 0.5f, 0.2f, 1.0f);
+            glDrawArrays(GL_TRIANGLES, 0, 36);
+            if (s.menu_by_ray)
+            {
+                const Hand& h = s.hands[1];
+                const float length = Length(s.menu_pointer - h.aim_pos);
+                const Mat4 ray = view_proj * Mat4::FromPose(h.aim_rot, h.aim_pos)
+                               * Mat4::Translation({0, 0, -length * 0.5f}) * Mat4::Scale({0.003f, 0.003f, length});
+                glUniformMatrix4fv(s.loc_solid_mvp, 1, GL_FALSE, ray.m);
+                glUniform4f(s.loc_solid_color, 0.55f, 0.15f, 0.09f, 1.0f);
+                glDrawArrays(GL_TRIANGLES, 0, 36);
+            }
+        }
+    }
+
     // Wrist panel.
     if (s.panel_shown)
     {
@@ -2116,6 +2327,14 @@ bool render_views(GLWorldViewRenderer& world, XrTime time,
     const Vec3 head_gaze = Rotate(to_quat(views[0].pose.orientation), {0, 0, -1});
     s.last_head = head;
     update_possession(head, head_gaze);
+
+    // Menu screen: shown while the game shows a menu, placed once in reach.
+    s.menu_shown = s_menu_wanted && s.menu_ready;
+    if (!s.menu_shown)
+        s.menu_placed = false;
+    else if (!s.menu_placed)
+        place_menu(head, head_gaze);
+    s_menu_in = update_menu_touch(s.hands[1]);
     const Vec3 viewer = stage_to_game(head);
     s_things.viewer_x = viewer.x;
     s_things.viewer_y = viewer.y;
@@ -2183,6 +2402,14 @@ bool render_views(GLWorldViewRenderer& world, XrTime time,
     }
     else
     {
+        s_select_held = false;
+    }
+    if (s.menu_shown)
+    {
+        // The menu has the hand; nothing goes to the dungeon meanwhile.
+        in = PointerInput();
+        s.ray_valid = false;
+        s.panel_shown = false;
         s_select_held = false;
     }
     s_pointer_in = in;
@@ -2263,6 +2490,7 @@ void GameThreadSync()
     }
 
     UpdateDungeonSnapshot(s_snapshot);
+    s_menu_wanted = MenuScreenWanted(s_snapshot.in_level);
     if (s_snapshot.in_level)
     {
         GetPossessionView(&s_possession);
@@ -2270,7 +2498,10 @@ void GameThreadSync()
         s_look_game = s_look;
         s_look_game.valid = s_look.valid && s_possession.active && s_possession.controlling;
         UpdateThingSnapshot(s_things);
-        ApplyPointer(s_pointer_in, &s_pointer_out);
+        if (s_menu_wanted)
+            ApplyMenuTouch(s_menu_in);  // a menu window over the level has the hand
+        else
+            ApplyPointer(s_pointer_in, &s_pointer_out);
         GetPanelInfo(&s_panel_info);
 
         // Listen where the head looks at the table; straight below the head
@@ -2303,6 +2534,7 @@ void GameThreadSync()
         s_listener.valid = false;
         s_possession = PossessionView();
         s_look_game.valid = false;
+        ApplyMenuTouch(s_menu_in);  // frontend menus: main menu, campaign map, ...
     }
 }
 
@@ -2360,6 +2592,7 @@ void RenderThreadFrame(GLWorldViewRenderer& world, unsigned int screen_fbo, int 
     if (!s.running)
         return;
     capture_panel((GLuint)screen_fbo, screen_w, screen_h);
+    capture_menu((GLuint)screen_fbo, screen_w, screen_h);
 
     XrFrameWaitInfo wait_info = {XR_TYPE_FRAME_WAIT_INFO};
     XrFrameState frame_state = {XR_TYPE_FRAME_STATE};

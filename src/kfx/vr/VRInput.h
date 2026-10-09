@@ -48,4 +48,20 @@ void ApplyPointer(const PointerInput& in, PointerResult* out);
 /** Game thread: where the side panel is on screen. */
 void GetPanelInfo(PanelInfo* out);
 
+/** Render thread -> game thread: a finger (or the ray) on the floating menu
+ *  screen, a copy of the whole desktop screen shown while a menu is up. */
+struct MenuInput {
+    bool valid = false;              /**< Over the screen. */
+    float u = 0, v = 0;              /**< Where: 0..1 left to right, bottom to top. */
+    bool press = false;              /**< Touching / trigger held: the left mouse button. */
+};
+
+/** Game thread: true while the game shows a menu rather than the dungeon:
+ *  the frontend (main menu, campaign map, ...) or a menu window in a level. */
+bool MenuScreenWanted(bool in_level);
+
+/** Game thread: moves the game's cursor to the touched spot and presses the
+ *  left button while touching. */
+void ApplyMenuTouch(const MenuInput& in);
+
 } // namespace VR

@@ -151,6 +151,26 @@ void ApplyPointer(const PointerInput& in, PointerResult* out)
     }
 }
 
+bool MenuScreenWanted(bool in_level)
+{
+    return !in_level || a_menu_window_is_active();
+}
+
+void ApplyMenuTouch(const MenuInput& in)
+{
+    if (in.valid && lbDisplay.GraphicsScreenWidth > 0 && lbDisplay.GraphicsScreenHeight > 0)
+    {
+        move_game_cursor((long)(in.u * lbDisplay.GraphicsScreenWidth),
+                         (long)((1.0f - in.v) * lbDisplay.GraphicsScreenHeight));
+    }
+    const bool press = in.valid && in.press;
+    if (press != s_left_down)
+    {
+        s_left_down = press;
+        set_left_button(press);
+    }
+}
+
 void GetPanelInfo(PanelInfo* out)
 {
     out->visible = panel_visible();
