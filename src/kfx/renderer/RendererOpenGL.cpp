@@ -503,7 +503,8 @@ void RendererOpenGL::render_thread_work()
 
     {
         KFX_ZONE_COLOR("VR::RenderThreadFrame", KFX_COLOR_RENDER_GPU);
-        VR::RenderThreadFrame(m_impl->world, m_impl->resource_mapper.GetScreenFramebuffer(), fd.screen_w, fd.screen_h);
+        VR::RenderThreadFrame(m_impl->world, m_impl->resource_mapper.GetScreenFramebuffer(), fd.screen_w, fd.screen_h,
+                              fd.drawable_w, fd.drawable_h);
     }
 
     // While a headset session runs, its frame timing paces this thread; desktop

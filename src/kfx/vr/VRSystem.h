@@ -20,9 +20,11 @@ void GameThreadSync();
 
 /** Render thread, after the desktop frame is drawn: render and submit both eyes.
  *  @p screen_fbo holds that frame (screen_w x screen_h); the side panel is copied
- *  from it onto the wrist panel.
+ *  from it onto the wrist panel. The window (window_w x window_h) then gets
+ *  a copy of the left eye, so people at the PC can watch.
  *  Starts the OpenXR session on first use. */
-void RenderThreadFrame(GLWorldViewRenderer& world, unsigned int screen_fbo, int screen_w, int screen_h);
+void RenderThreadFrame(GLWorldViewRenderer& world, unsigned int screen_fbo, int screen_w, int screen_h,
+                       int window_w, int window_h);
 
 /** Render thread: true while a headset session is running (desktop vsync is
  *  turned off then, so it does not hold back the headset's frame timing). */

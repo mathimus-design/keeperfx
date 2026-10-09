@@ -73,6 +73,9 @@ void ReturnToHand();
 int PlayerWorkState();
 bool PlainHand();
 
+/** Game thread: true once the level is won or lost (waiting to continue). */
+bool LevelDecided();
+
 /** Game thread: true while the game shows a menu rather than the dungeon:
  *  the frontend (main menu, campaign map, ...), a menu window in a level, or
  *  the game paused. */

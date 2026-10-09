@@ -77,6 +77,7 @@ struct ThingSnapshot {
     bool reset_cache = false;                /**< Render thread lost its textures; resend all images. */
     // Game thread's own setting
     int hide_thing = 0;                      /**< Thing not to draw: the possessed creature, seen from inside. */
+    int highlight_thing = 0;                 /**< Thing to flash white: what a swat would slap. */
 };
 
 /** The creature the player is possessing (or riding along with), seen from its eyes. */
@@ -91,6 +92,11 @@ struct PossessionView {
 
 /** Game thread: fill @p out from the local player's view. */
 void GetPossessionView(PossessionView* out);
+
+/** Game thread: the slappable thing nearest to (x, y) within @p radius game
+ *  units, 0 for none; only while the Keeper's hand is empty, as slapping
+ *  needs. */
+int FindSlapTarget(float x, float y, float radius);
 
 /** Game thread: pick up the player's next creature of @p kind into the hand,
  *  as clicking its icon in the panel's creature tab does. */

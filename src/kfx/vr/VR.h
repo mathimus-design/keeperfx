@@ -40,6 +40,15 @@ int VR_GetPossessionControls(int* yaw, int* pitch, int* move_x, int* move_y);
  *  pressed; the input code then toggles pause as for the pause key. */
 int VR_ConsumePauseRequest(void);
 
+/** Game thread: once a swat of the Keeper's hand has picked a creature, its
+ *  thing index (once), for the input code to slap like a right-click. */
+int VR_ConsumeSlapTarget(void);
+
+/** Game thread: non-zero once after A or the trigger was pressed while the
+ *  level is won or lost; the input code then finishes the level as for the
+ *  finish-level key (space). */
+int VR_ConsumeFinishRequest(void);
+
 #ifdef __cplusplus
 }
 #endif

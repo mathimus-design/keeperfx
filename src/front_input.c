@@ -1062,7 +1062,8 @@ static short get_global_inputs(void)
       return true;
   if (get_screen_capture_inputs())
       return true;
-  if (player->victory_state != VicS_Undecided && is_game_key_pressed(Gkey_FinishLevel, true, false))
+  // VR: A or the trigger once the level is won or lost, like the space bar.
+  if (player->victory_state != VicS_Undecided && (is_game_key_pressed(Gkey_FinishLevel, true, false) || VR_ConsumeFinishRequest()))
       {
         if ((player->victory_state == VicS_LostLevel) && network_is_active() && (player->id_number == get_net_user_player_number(SERVER_ID)) && network_human_contenders_remain())
         {
@@ -2194,6 +2195,14 @@ static void set_packet_action_for_thing_under_hand(struct Packet* pckt)
     NetUserId user = get_local_user();
     struct PlayerInfo* player = get_my_player();
     struct UserState* ustate = get_local_user_state();
+    // A swat of the VR hand slaps the creature it swept over, as a right-click on it would.
+    if ((get_local_view_type(player) == PVT_DungeonTop) && (pckt->action == PckA_None)) {
+        int vr_slap = VR_ConsumeSlapTarget();
+        if (vr_slap > 0) {
+            set_packet_power_on_thing(pckt, PwrK_SLAP, vr_slap);
+            return;
+        }
+    }
     if ((get_local_view_type(player) != PVT_DungeonTop) || ((pckt->control_flags & PCtr_Gui) != 0) || (local_state.local_thing_under_hand <= 0) || (pckt->action != PckA_None) || (get_gameturn() - hand_pick_pending_turn <= game.input_lag_turns)) {
         return;
     }

@@ -462,6 +462,9 @@ struct State {
     float fp_yaw = 0;
     Vec3 fp_eye = {0, 0, 0};                    // game units
     Vec3 last_head = {0, 0, 0};                 // head position of the last rendered frame
+    int window_w = 0, window_h = 0;             // desktop window, for the spectator mirror
+    bool finish_was_down = false;               // A / trigger last frame, to continue after a level
+    float decided_time = 0;                     // seconds since the level was won or lost
     float frame_dt = 0;                         // seconds, this frame
     // Pickaxe swing detection (possessing a digger).
     bool swing_have_last = false;
@@ -509,6 +512,10 @@ struct State {
     int palm_flash = -1;                    // icon just tapped, flashing
     float palm_flash_time = 0;              // seconds of flash left
     float point_pose = 0;                   // 0..1: right hand easing into a pointing pose
+    // Slap gesture: the right palm's last position, and a pause between swats.
+    bool slap_have_last = false;
+    Vec3 slap_last = {0, 0, 0};
+    float slap_cooldown = 0;
     Vec3 palm_right = {1, 0, 0}, palm_up = {0, 1, 0}, palm_normal = {0, 0, 1};
 
     // Wrist panel: copy of the desktop side panel, shown above the left hand.
@@ -635,6 +642,25 @@ bool s_plain_hand = true;
  *  that the input code takes once. */
 bool s_pause_request = false;
 bool s_pause_pending = false;
+
+/** The level is won or lost (game -> render); A or the trigger then asks to
+ *  continue (render -> game), taken once by the input code. */
+bool s_level_decided = false;
+bool s_finish_request = false;
+bool s_finish_pending = false;
+
+/** Slapping with the hand: where the right palm is over the map and whether
+ *  it just swatted (render -> game); the target picked, for the input code,
+ *  and that one landed, for the buzz (game -> render). */
+struct SlapInput {
+    bool low = false;            // palm low over the table
+    bool swipe = false;          // fast swat this frame
+    float x = 0, y = 0;          // palm over the map, game units
+    float radius = 0;            // how far from the palm a creature counts
+};
+SlapInput s_slap_in;
+int s_slap_pending = 0;
+bool s_slap_landed = false;
 
 /** Creature type to pick up from the palm menu (render -> game), 0 for none. */
 int s_palm_pick_kind = 0;
@@ -1001,17 +1027,19 @@ bool create_actions()
         "/interaction_profiles/oculus/touch_controller",
         "/interaction_profiles/valve/index_controller",
     };
-    // Pause: the left menu button on Touch controllers; Index ones have none,
-    // so their left B. Paths differ per controller, so it is added per profile.
-    const char* const pause_paths[] = {
-        "/user/hand/left/input/menu/click",
-        "/user/hand/left/input/b/click",
+    // Pause: the left menu button and Y on Touch controllers (SteamVR keeps the
+    // menu button for its dashboard, so Y always works); Index ones have no
+    // menu button, so their left B and A. Paths differ per controller.
+    const char* const pause_paths[][2] = {
+        { "/user/hand/left/input/menu/click", "/user/hand/left/input/y/click" },
+        { "/user/hand/left/input/b/click",    "/user/hand/left/input/a/click" },
     };
     for (size_t p = 0; p < sizeof(profiles) / sizeof(profiles[0]); p++)
     {
         const char* const profile = profiles[p];
         const XrActionSuggestedBinding bindings[] = {
-            {s.pause_action,    to_path(pause_paths[p])},
+            {s.pause_action,    to_path(pause_paths[p][0])},
+            {s.pause_action,    to_path(pause_paths[p][1])},
             {s.pose_action,     to_path("/user/hand/left/input/grip/pose")},
             {s.pose_action,     to_path("/user/hand/right/input/grip/pose")},
             {s.grip_action,     to_path("/user/hand/left/input/squeeze/value")},
@@ -2573,6 +2601,54 @@ void update_possession(Vec3 head, Vec3 gaze)
     s_look = look;
 }
 
+Vec3 stage_to_game(Vec3 p);
+void buzz(int hand, float amplitude, float seconds);
+
+/** Slap gesture: the right palm swatting low over the table. The game thread
+ *  picks the nearest slappable creature to where it swept (generously, as
+ *  creatures move fast) and flashes it while the palm is near. */
+void update_slap(const Hand& hand)
+{
+    SlapInput in;
+    if (s_slap_landed)
+    {
+        s_slap_landed = false;
+        buzz(1, 1.0f, 0.09f);  // a solid thwack
+    }
+    const bool can = s.in_level && !s.possessing && !s.menu_shown && !s.panel_finger && !s.palm_shown
+                  && hand.tracked && hand.aim_tracked && hand.grip < 0.5f && !s_select_held;
+    if (!can)
+    {
+        s.slap_have_last = false;
+        s_slap_in = in;
+        return;
+    }
+    // Where the hand strikes: about the middle of the fingers, ahead of the
+    // palm (the aim pose's -Z runs along them), where a swat lands and moves fastest.
+    const Vec3 palm = hand.pos + Rotate(hand.aim_rot, {0.028f, 0.0f, -0.075f});
+    const Vec3 g = stage_to_game(palm);
+    // Low over the table: within about three cubes of the floor (whatever the table's size).
+    in.low = g.z < 256.0f + 3.0f * 256.0f && g.z > -256.0f;
+    in.x = g.x;
+    in.y = g.y;
+    // About 7 cm on the table, but never less than a slab and a half.
+    in.radius = std::fmax(384.0f, 0.07f / s.table_scale);
+    s.slap_cooldown -= s.frame_dt;
+    if (s.slap_have_last && s.frame_dt > 0.0f)
+    {
+        constexpr float k_swat_speed = 1.6f;  // m/s
+        const float speed = Length(palm - s.slap_last) / s.frame_dt;
+        if (in.low && speed > k_swat_speed && s.slap_cooldown <= 0.0f)
+        {
+            in.swipe = true;
+            s.slap_cooldown = 0.45f;  // one slap per swat
+        }
+    }
+    s.slap_last = palm;
+    s.slap_have_last = true;
+    s_slap_in = in;
+}
+
 /** Game units -> reference space; same as table_model() applied to a point. */
 Vec3 game_to_stage(Vec3 g)
 {
@@ -3157,6 +3233,36 @@ void draw_eye(const EyeTarget& eye, const Mat4& view_proj, const GLWorldViewRend
     glUseProgram(0);
 }
 
+/** Copies the left eye's image (bound as the read framebuffer's source) into
+ *  the desktop window, cropped to the window's shape about its middle, so
+ *  people at the PC see what the headset sees. The desktop frame was already
+ *  presented there; this replaces it until the swap. */
+void mirror_to_window(const EyeTarget& eye)
+{
+    if (s.window_w <= 0 || s.window_h <= 0 || eye.w <= 0 || eye.h <= 0)
+        return;
+    const float window_aspect = (float)s.window_w / (float)s.window_h;
+    const float eye_aspect = (float)eye.w / (float)eye.h;
+    int sx0 = 0, sy0 = 0, sx1 = eye.w, sy1 = eye.h;
+    if (window_aspect > eye_aspect)
+    {
+        // Wider window: all of the eye's width, a band across its middle.
+        const int band = (int)((float)eye.w / window_aspect);
+        sy0 = (eye.h - band) / 2;
+        sy1 = sy0 + band;
+    }
+    else
+    {
+        const int band = (int)((float)eye.h * window_aspect);
+        sx0 = (eye.w - band) / 2;
+        sx1 = sx0 + band;
+    }
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, eye.fbo);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+    glBlitFramebuffer(sx0, sy0, sx1, sy1, 0, 0, s.window_w, s.window_h, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+    glBindFramebuffer(GL_FRAMEBUFFER, eye.fbo);
+}
+
 bool render_views(GLWorldViewRenderer& world, XrTime time,
                   XrCompositionLayerProjection& layer, XrCompositionLayerProjectionView* proj_views)
 {
@@ -3190,6 +3296,22 @@ bool render_views(GLWorldViewRenderer& world, XrTime time,
     else if (!s.menu_placed)
         place_menu(head, head_gaze);
     s_menu_in = update_menu_touch(s.hands[1]);
+    // Won or lost: A or the trigger continues, like the space bar. Not inside a
+    // creature, and only after a moment, so the blow that won the level (or a
+    // held trigger) does not skip straight past the result.
+    {
+        if (s_level_decided)
+            s.decided_time += s.frame_dt;
+        else
+            s.decided_time = 0.0f;
+        const bool down = s.hands[1].action || s.hands[1].trigger > 0.6f;
+        if (s_level_decided && !s.possessing && s.decided_time > 1.5f && down && !s.finish_was_down)
+        {
+            s_finish_request = true;
+            buzz(1, 0.7f, 0.06f);
+        }
+        s.finish_was_down = down;
+    }
     const Vec3 viewer = stage_to_game(head);
     s_things.viewer_x = viewer.x;
     s_things.viewer_y = viewer.y;
@@ -3374,6 +3496,7 @@ bool render_views(GLWorldViewRenderer& world, XrTime time,
     update_text_alert(head_gaze);
     s_pointer_in = in;
     update_palm_menu(head);
+    update_slap(pointer);
 
     // Ease the right hand into a pointing pose (index out, the rest curled)
     // while its fingertip nears something to press.
@@ -3440,6 +3563,8 @@ bool render_views(GLWorldViewRenderer& world, XrTime time,
         const Mat4 proj = Mat4::Projection(fov.angleLeft, fov.angleRight, fov.angleUp, fov.angleDown, k_near, k_far);
         const Mat4 view = Mat4::FromPose(to_quat(views[i].pose.orientation), to_vec(views[i].pose.position)).InverseRigid();
         draw_eye(eye, proj * view, tex);
+        if (i == 0)
+            mirror_to_window(eye);
 
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
         XrSwapchainImageReleaseInfo release = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
@@ -3507,6 +3632,18 @@ void GameThreadSync()
                 return_to_hand_frames = 0;
         }
         s_things.hide_thing = s_possession.active ? s_possession.thing_idx : 0;
+        // Slap: flash what a swat would hit; a swat sends it to the input code.
+        s_things.highlight_thing = 0;
+        if (s_slap_in.low && !s_possession.active)
+        {
+            const int target = FindSlapTarget(s_slap_in.x, s_slap_in.y, s_slap_in.radius);
+            s_things.highlight_thing = target;
+            if (s_slap_in.swipe && target > 0)
+            {
+                s_slap_pending = target;
+                s_slap_landed = true;
+            }
+        }
         s_look_game = s_look;
         s_look_game.valid = s_look.valid && s_possession.active && s_possession.controlling;
         UpdateThingSnapshot(s_things);
@@ -3520,6 +3657,12 @@ void GameThreadSync()
         GetInfoBox(&s_info_box);
         s_spell_chosen = SpellChosen();
         s_possess_chosen = PossessChosen();
+        s_level_decided = LevelDecided();
+        if (s_finish_request)
+        {
+            s_finish_request = false;
+            s_finish_pending = true;  // taken by VR_ConsumeFinishRequest()
+        }
         s_work_state = PlayerWorkState();
         s_plain_hand = PlainHand();
         if (s_palm_pick_kind != 0)
@@ -3561,14 +3704,19 @@ void GameThreadSync()
         s_spell_chosen = false;
         s_possess_chosen = false;
         s_info_box.visible = false;
+        s_level_decided = false;
+        s_finish_pending = false;
         ApplyMenuTouch(s_menu_in);  // frontend menus: main menu, campaign map, ...
     }
 }
 
-void RenderThreadFrame(GLWorldViewRenderer& world, unsigned int screen_fbo, int screen_w, int screen_h)
+void RenderThreadFrame(GLWorldViewRenderer& world, unsigned int screen_fbo, int screen_w, int screen_h,
+                       int window_w, int window_h)
 {
     if (!vr_requested || s.failed)
         return;
+    s.window_w = window_w;
+    s.window_h = window_h;
     s_head_in.valid = false;  // set again below if this frame reaches the headset
     if (!s.gl_ready)
     {
@@ -3676,6 +3824,23 @@ int VR_GetSoundListener(int* x, int* y, int* z, int* angle)
     return 1;
 }
 
+int VR_ConsumeFinishRequest(void)
+{
+    if (!vr_requested || !VR::s_finish_pending)
+        return 0;
+    VR::s_finish_pending = false;
+    return 1;
+}
+
+int VR_ConsumeSlapTarget(void)
+{
+    if (!vr_requested || VR::s_slap_pending <= 0)
+        return 0;
+    const int target = VR::s_slap_pending;
+    VR::s_slap_pending = 0;
+    return target;
+}
+
 int VR_ConsumePauseRequest(void)
 {
     if (!vr_requested || !VR::s_pause_pending)
@@ -3705,7 +3870,7 @@ int VR_IsHeadsetActive(void)
 
 namespace VR {
 void GameThreadSync() {}
-void RenderThreadFrame(GLWorldViewRenderer&, unsigned int, int, int) {}
+void RenderThreadFrame(GLWorldViewRenderer&, unsigned int, int, int, int, int) {}
 bool IsSessionRunning() { return false; }
 void RenderThreadShutdown() {}
 } // namespace VR
@@ -3713,6 +3878,8 @@ void RenderThreadShutdown() {}
 int VR_GetSoundListener(int*, int*, int*, int*) { return 0; }
 int VR_IsHeadsetActive(void) { return 0; }
 int VR_ConsumePauseRequest(void) { return 0; }
+int VR_ConsumeSlapTarget(void) { return 0; }
+int VR_ConsumeFinishRequest(void) { return 0; }
 int VR_GetPossessionControls(int*, int*, int*, int*) { return 0; }
 
 #include "post_inc.h"

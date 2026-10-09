@@ -200,11 +200,18 @@ bool PlainHand()
     return player != nullptr && player->work_state == PSt_CtrlDungeon;
 }
 
+bool LevelDecided()
+{
+    struct PlayerInfo* player = get_my_player();
+    return player != nullptr && player->victory_state != VicS_Undecided;
+}
+
 bool MenuScreenWanted(bool in_level)
 {
     // Paused too: the screen shows the game's pause display, and its menus
-    // (options, quit) can be reached from it.
-    return !in_level || a_menu_window_is_active() || (game.operation_flags & GOF_Paused) != 0;
+    // (options, quit) can be reached from it. And once the level is won or
+    // lost, to show the game's "press to continue" message.
+    return !in_level || a_menu_window_is_active() || (game.operation_flags & GOF_Paused) != 0 || LevelDecided();
 }
 
 void ApplyMenuTouch(const MenuInput& in)

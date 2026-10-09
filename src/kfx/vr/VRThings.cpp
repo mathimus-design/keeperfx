@@ -19,6 +19,8 @@
 #include "engine_render.h"     // resolve_keepersprite_draw_data(), interpolate_thing()
 #include "player_data.h"       // my_player_number, get_my_player()
 #include "local_camera.h"      // get_local_view_type()
+#include "power_hand.h"        // power_hand_is_empty(), thing_slappable()
+#include "config_players.h"    // PSt_CtrlDungeon
 #include "dungeon_data.h"      // get_my_dungeon(), things_in_hand
 #include "creature_control.h"  // struct CreatureControl, creature_control_get_from_thing()
 #include "config_creature.h"   // creature_stats_get_from_thing(), get_creature_model_flags(), CMF_*
@@ -503,6 +505,9 @@ void add_thing(ThingSnapshot& snap, struct Thing* thing, int hand_slot)
     b.flip = flip ? 1 : 0;
     b.kind = SK_Upright;
     b.one_colour = -1;
+    // What a swat would slap blinks white, as the desktop flashes the thing under the hand.
+    if (!in_hand && thing->index == snap.highlight_thing && (get_gameturn() % 4) < 2)
+        b.one_colour = colours[15][15][15];
     b.lift = 0.0f;
     switch (thing->rendering_flags & TRF_Transpar_Flags)
     {
@@ -540,6 +545,47 @@ void add_thing(ThingSnapshot& snap, struct Thing* thing, int hand_slot)
 }
 
 } // namespace
+
+int FindSlapTarget(float x, float y, float radius)
+{
+    struct PlayerInfo* player = get_my_player();
+    if (player == nullptr || !power_hand_is_empty(player) || player->work_state != PSt_CtrlDungeon)
+        return 0;
+    const int r = (int)(radius / COORD_PER_STL) + 1;
+    const int cx = (int)(x / COORD_PER_STL), cy = (int)(y / COORD_PER_STL);
+    float best_d2 = radius * radius;
+    int best = 0;
+    for (int sy = cy - r; sy <= cy + r; sy++)
+    {
+        for (int sx = cx - r; sx <= cx + r; sx++)
+        {
+            if (sx < 0 || sy < 0 || sx >= game.map_subtiles_x || sy >= game.map_subtiles_y)
+                continue;
+            struct Map* mapblk = get_map_block_at(sx, sy);
+            if (!map_block_revealed(mapblk, my_player_number))
+                continue;
+            long i = get_mapwho_thing_index(mapblk);
+            unsigned long guard = 0;
+            while (i > 0 && guard++ < THINGS_COUNT)
+            {
+                struct Thing* thing = thing_get(i);
+                if (thing_is_invalid(thing))
+                    break;
+                i = thing->next_on_mapblk;
+                if (!thing_slappable(thing, player->id_number))
+                    continue;
+                const float dx = (float)thing->mappos.x.val - x, dy = (float)thing->mappos.y.val - y;
+                const float d2 = dx * dx + dy * dy;
+                if (d2 < best_d2)
+                {
+                    best_d2 = d2;
+                    best = thing->index;
+                }
+            }
+        }
+    }
+    return best;
+}
 
 void PickUpCreatureOfKind(int kind)
 {
