@@ -39,6 +39,9 @@ enum SpriteKind : uint8_t {
     SK_Shadow  = 1,  /**< A soft round shadow flat on the floor; left/right/bottom/top are its radii. */
 };
 
+/** sprite_id of a plain filled quad, coloured by one_colour (flag poles, bars). */
+constexpr int32_t k_solid_sprite_id = -3;
+
 /** A decoded sprite frame: per pixel a palette index and a coverage byte. */
 struct SpriteImage {
     int32_t id;

@@ -32,6 +32,10 @@
 #include "player_instances.h"  // PLAYER_NEUTRAL
 #include "keeperfx.hpp"        // MFlg_NoHeroHealthFlower
 #include "kfx/renderer/RendererManager.h" // RendererGetDrawFlags()
+#include "vidfade.h"           // colours
+#include "config_settings.h"   // settings.roomflags_on
+#include "config_terrain.h"    // room_can_have_ensign(), get_room_kind_stats()
+#include "config_magic.h"      // struct RoomConfigStats medsym_sprite_idx
 #include <cmath>
 #include <unordered_set>
 #include "post_inc.h"
@@ -39,6 +43,9 @@
 /* engine_render.c; not in a header. */
 extern "C" void fill_status_sprite_indexes(struct Thing *thing, struct CreatureControl *cctrl, short *health_spridx,
                                            short *state_spridx, short *anger_spridx);
+extern "C" TbBool cursor_on_room(RoomIndex room_index);
+extern "C" TbBool room_is_damaged(RoomIndex room_index);
+extern "C" TbBool placing_same_room_type(RoomIndex room_index);
 
 namespace VR {
 
@@ -253,6 +260,130 @@ void add_status(ThingSnapshot& snap, struct Thing* thing, float px, float py, fl
     }
 }
 
+/** A plain filled upright rectangle in one palette colour. Extents are
+ *  relative to the anchor as for any billboard. */
+void add_solid(ThingSnapshot& snap, float x, float y, float z, float left, float right, float bottom, float top,
+               TbPixel colour, float lift)
+{
+    SpriteBillboard b = {};
+    b.x = x; b.y = y; b.z = z;
+    b.left = left; b.right = right; b.bottom = bottom; b.top = top;
+    b.stl_x = b.stl_y = -1.0f;
+    b.sprite_id = k_solid_sprite_id;
+    b.kind = SK_Upright;
+    b.one_colour = colour;
+    b.lift = lift;
+    snap.sprites.push_back(b);
+}
+
+/** Adds a GUI sprite with its top-left corner at (left, top) around the anchor. */
+void add_overlay_sprite(ThingSnapshot& snap, const struct TbSprite* spr, float x, float y, float z,
+                        float left, float top, float unit, float lift)
+{
+    if (spr == nullptr || spr->Data == nullptr || spr->SWidth == 0 || spr->SHeight == 0)
+        return;
+    add_status_layer(snap, spr, x, y, z, unit, -1, 0, lift);
+    SpriteBillboard& b = snap.sprites.back();
+    b.left = left;
+    b.right = left + spr->SWidth * unit;
+    b.top = top;
+    b.bottom = top - spr->SHeight * unit;
+}
+
+/** Floating gold when buying or selling: the number's digits, as
+ *  draw_engine_number() lays them out. */
+void add_price(ThingSnapshot& snap, struct Thing* thing)
+{
+    long number = thing->price_effect.number;
+    if (number <= 0)
+        return;
+    const struct ThingInterpolateResult interp = interpolate_thing(thing);
+    const struct TbSprite* digit0 = get_button_sprite(GBS_fontchars_number_dig0);
+    if (digit0 == nullptr || digit0->SWidth == 0)
+        return;
+    constexpr float unit = 9.0f;  // game units per GUI pixel
+    const float w = digit0->SWidth * unit;
+    int ndigits = 0;
+    for (long n = number; n > 0; n /= 10)
+        ndigits++;
+    // Rightmost digit first, centred on the thing.
+    float left = w * (float)(ndigits - 1) * 0.5f - w * 0.5f;
+    for (long n = number; n > 0; n /= 10)
+    {
+        add_overlay_sprite(snap, get_button_sprite((short)((n % 10) + GBS_fontchars_number_dig0)),
+                           (float)interp.mappos.x.val, (float)interp.mappos.y.val, (float)interp.mappos.z.val,
+                           left, digit0->SHeight * unit, unit, 6.0f);
+        left -= w;
+    }
+}
+
+/** A room's flag: pole, ensign with the room's symbol and its health,
+ *  capacity and efficiency bars. Shown when draw_engine_room_flagpole() /
+ *  draw_room_flag_top() would show it, which do_map_who_for_thing() decides. */
+void add_room_flag(ThingSnapshot& snap, struct Thing* thing)
+{
+    if (!settings.roomflags_on)
+        return;
+    const RoomIndex room_idx = thing->lair.belongs_to;
+    if (!cursor_on_room(room_idx) && !room_is_damaged(room_idx) && !placing_same_room_type(room_idx))
+        return;
+    // The flag rises once it has been asked for 10 turns in a row; shared with
+    // the desktop renderer, which keeps the same count once per turn.
+    const GameTurn turn = get_gameturn();
+    if (turn - thing->roomflag.last_turn_drawn == 1)
+    {
+        if (thing->roomflag.display_timer < 10)
+            thing->roomflag.display_timer++;
+    }
+    else if (turn - thing->roomflag.last_turn_drawn > 1)
+    {
+        thing->roomflag.display_timer = 0;
+    }
+    thing->roomflag.last_turn_drawn = turn;
+    if (thing->roomflag.display_timer != 10)
+        return;
+    struct Room* room = room_get(thing->roomflag.room_idx);
+    if (!room_exists(room) || !room_can_have_ensign(room->kind))
+        return;
+
+    const struct ThingInterpolateResult interp = interpolate_thing(thing);
+    const float x = (float)interp.mappos.x.val, y = (float)interp.mappos.y.val, z = (float)interp.mappos.z.val;
+    // Iso view sizes in game units: the pole's top is 1024 above the flag's
+    // position. GUI parts are in "base units" (a 16-unit-per-pixel UI pixel).
+    constexpr float k_pole_top = 1024.0f;
+    constexpr float k_base = 5.5f;
+    add_solid(snap, x, y, z, 0.0f, 4.0f * k_base, 0.0f, k_pole_top, colours[3][1][0], 0.0f);
+    add_solid(snap, x, y, z, 2.0f * k_base, 3.0f * k_base, 0.0f, k_pole_top, colours[1][0][0], 2.0f);
+
+    const struct TbSprite* ensign = get_panel_sprite(GPS_rpanel_room_ensign_filled);
+    if (ensign == nullptr || ensign->SHeight == 0)
+        return;
+    // The ensign is drawn 36 base units tall; its own pixels scale to match.
+    const float unit = 36.0f * k_base / (float)ensign->SHeight;
+    add_overlay_sprite(snap, ensign, x, y, z, 0.0f, k_pole_top, unit, 4.0f);
+    const struct RoomConfigStats* roomst = get_room_kind_stats(room->kind);
+    add_overlay_sprite(snap, get_panel_sprite(roomst->medsym_sprite_idx), x, y, z,
+                       -2.0f * k_base, k_pole_top + 4.0f * k_base, unit, 6.0f);
+
+    // Bars: the ensign has them full; black boxes cover the empty part from the right.
+    const int bar_full = 10;  // ROOM_FLAG_PROGRESS_BAR_WIDTH in engine_render.c
+    int empty[3] = { 0, 0, 0 };
+    if (room->slabs_count > 0)
+        empty[0] = bar_full - (int)(bar_full * room->health / compute_room_max_health(room->slabs_count, room->efficiency));
+    if (room->total_capacity > 0)
+        empty[1] = bar_full - (int)(bar_full * room->used_capacity / room->total_capacity);
+    empty[2] = bar_full - (int)(bar_full * room->efficiency / ROOM_EFFICIENCY_MAX);
+    const float bar_right = ensign->SWidth * unit - 0.5f * k_base;
+    for (int i = 0; i < 3; i++)
+    {
+        if (empty[i] <= 0)
+            continue;
+        const float top = k_pole_top - (8.0f * (float)(i + 1)) * k_base;
+        add_solid(snap, x, y, z, bar_right - 2.0f * empty[i] * k_base, bar_right, top - 5.0f * k_base, top,
+                  colours[0][0][0], 8.0f);
+    }
+}
+
 /** @param hand_slot -1 for a thing on the map, else its place in the Keeper's hand. */
 void add_thing(ThingSnapshot& snap, struct Thing* thing, int hand_slot)
 {
@@ -395,7 +526,13 @@ void UpdateThingSnapshot(ThingSnapshot& snap)
                 if (thing_is_invalid(thing))
                     break;
                 i = thing->next_on_mapblk;
-                if (should_draw(thing, player))
+                if ((thing->rendering_flags & TRF_Invisible) != 0)
+                    continue;
+                if (thing->draw_class == ODC_RoomPrice)
+                    add_price(snap, thing);
+                else if (thing->draw_class == ODC_RoomStatusFlag)
+                    add_room_flag(snap, thing);
+                else if (should_draw(thing, player))
                     add_thing(snap, thing, -1);
             }
         }

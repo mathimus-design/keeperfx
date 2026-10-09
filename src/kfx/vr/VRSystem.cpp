@@ -690,6 +690,19 @@ bool create_gl_resources()
     glBindVertexArray(0);
     glBindBuffer(GL_ARRAY_BUFFER, 0);
     s_things.reset_cache = true;  // no sprite textures yet: have the game thread send them all
+    {
+        // One covered pixel; filled quads take their colour from one_colour.
+        const uint8_t texel[2] = { 0, 255 };
+        GLuint& tex = s.sprite_textures[k_solid_sprite_id];
+        glGenTextures(1, &tex);
+        glBindTexture(GL_TEXTURE_2D, tex);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RG8, 1, 1, 0, GL_RG, GL_UNSIGNED_BYTE, texel);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glBindTexture(GL_TEXTURE_2D, 0);
+    }
 
     glUseProgram(s.world_prog);
     glUniform1i(glGetUniformLocation(s.world_prog, "u_tile_atlas"), 0);
