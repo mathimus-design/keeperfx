@@ -73,6 +73,15 @@ struct Mat4 {
         r.m[2] = -s; r.m[10] = c;
         return r;
     }
+    /** Rotation about X; positive turns -Z towards +Y. */
+    static Mat4 RotationX(float angle)
+    {
+        Mat4 r = Identity();
+        const float c = std::cos(angle), s = std::sin(angle);
+        r.m[5] = c;  r.m[9]  = -s;
+        r.m[6] = s;  r.m[10] = c;
+        return r;
+    }
     /** Rigid transform from a rotation and a position. */
     static Mat4 FromPose(Quat q, Vec3 p)
     {

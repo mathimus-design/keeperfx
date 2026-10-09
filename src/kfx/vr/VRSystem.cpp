@@ -76,7 +76,7 @@ namespace {
     X(xrCreateActionSet) X(xrStringToPath) X(xrCreateAction) X(xrSuggestInteractionProfileBindings) \
     X(xrAttachSessionActionSets) X(xrCreateActionSpace) X(xrPollEvent) X(xrBeginSession) \
     X(xrEndSession) X(xrLocateSpace) X(xrSyncActions) X(xrGetActionStateFloat) \
-    X(xrGetActionStateBoolean) X(xrLocateViews) X(xrAcquireSwapchainImage) \
+    X(xrGetActionStateBoolean) X(xrGetActionStateVector2f) X(xrLocateViews) X(xrAcquireSwapchainImage) \
     X(xrWaitSwapchainImage) X(xrReleaseSwapchainImage) X(xrWaitFrame) X(xrBeginFrame) X(xrEndFrame)
 
 #define VR_XR_DECLARE(name) PFN_##name name = nullptr;
@@ -322,6 +322,36 @@ out vec4 fragColor;
 void main() { fragColor = vec4(texture(u_panel, v_uv).rgb, 1.0); }
 )glsl";
 
+/* Simple lit solid colour, for the Keeper's hand. */
+const char* const k_lit_vs = R"glsl(
+#version 330 core
+layout(location = 0) in vec3 a_pos;
+layout(location = 1) in vec3 a_normal;
+uniform mat4 u_mvp;
+uniform mat4 u_model;
+out vec3 v_normal;
+void main()
+{
+    gl_Position = u_mvp * vec4(a_pos, 1.0);
+    v_normal = mat3(transpose(inverse(u_model))) * a_normal;
+}
+)glsl";
+
+const char* const k_lit_fs = R"glsl(
+#version 330 core
+in vec3 v_normal;
+uniform vec4 u_color;
+uniform vec3 u_light_dir;   // towards the light, reference space
+out vec4 fragColor;
+void main()
+{
+    vec3 n = normalize(v_normal);
+    float diffuse = max(dot(n, u_light_dir), 0.0);
+    float fill = 0.5 + 0.5 * n.y;   // soft light from above
+    fragColor = vec4(u_color.rgb * (0.22 + 0.55 * diffuse + 0.23 * fill), 1.0);
+}
+)glsl";
+
 const char* const k_solid_vs = R"glsl(
 #version 330 core
 layout(location = 0) in vec3 a_pos;
@@ -402,6 +432,11 @@ struct State {
     XrAction select_action = XR_NULL_HANDLE;
     XrAction hand_action = XR_NULL_HANDLE;
     XrAction panel_toggle_action = XR_NULL_HANDLE;
+    XrAction scroll_action = XR_NULL_HANDLE;    // left thumbstick
+    float scroll_x = 0, scroll_y = 0;           // its current deflection
+    Vec3 head_forward = {0, 0, -1};             // horizontal, from the last rendered frame
+    bool ray_valid = false;                     // the pointing ray, out of the right palm
+    Vec3 ray_origin = {0, 0, 0}, ray_dir = {0, 0, -1};
     XrPath hand_paths[2] = {XR_NULL_PATH, XR_NULL_PATH};
     XrSpace hand_spaces[2] = {XR_NULL_HANDLE, XR_NULL_HANDLE};
     XrSpace aim_spaces[2] = {XR_NULL_HANDLE, XR_NULL_HANDLE};
@@ -415,6 +450,9 @@ struct State {
     GLuint solid_prog = 0;
     GLint loc_solid_mvp = -1, loc_solid_color = -1;
     GLuint cube_vao = 0, cube_vbo = 0;
+    GLuint lit_prog = 0;
+    GLint loc_lit_mvp = -1, loc_lit_model = -1, loc_lit_color = -1, loc_lit_light = -1;
+    GLuint lit_cube_vao = 0, lit_cube_vbo = 0;   // unit cube with face normals
     GLuint sprite_prog = 0;
     GLint loc_sprite_mvp = -1, loc_sprite_stride = -1, loc_sprite_min_shade = -1;
     GLint loc_sprite_use_fade = -1, loc_sprite_alpha = -1;
@@ -571,8 +609,44 @@ bool create_gl_resources()
     s.solid_prog = link_program(k_solid_vs, k_solid_fs, "VR solid");
     s.sprite_prog = link_program(k_sprite_vs, k_sprite_fs, "VR sprite");
     s.panel_prog = link_program(k_panel_vs, k_panel_fs, "VR panel");
-    if (s.world_prog == 0 || s.solid_prog == 0 || s.sprite_prog == 0 || s.panel_prog == 0)
+    s.lit_prog = link_program(k_lit_vs, k_lit_fs, "VR lit");
+    if (s.world_prog == 0 || s.solid_prog == 0 || s.sprite_prog == 0 || s.panel_prog == 0 || s.lit_prog == 0)
         return false;
+
+    s.loc_lit_mvp   = glGetUniformLocation(s.lit_prog, "u_mvp");
+    s.loc_lit_model = glGetUniformLocation(s.lit_prog, "u_model");
+    s.loc_lit_color = glGetUniformLocation(s.lit_prog, "u_color");
+    s.loc_lit_light = glGetUniformLocation(s.lit_prog, "u_light_dir");
+    {
+        // Unit cube centred on the origin, position + face normal per vertex.
+        std::vector<float> cube;
+        const float faces[6][3] = { {1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1} };
+        for (const auto& n : faces)
+        {
+            // Two axes spanning the face (culling is off, so winding does not matter).
+            const float u[3] = { n[0] == 0 ? 1.0f : 0.0f, n[0] != 0 ? 1.0f : 0.0f, 0.0f };
+            const float v[3] = { n[1] * u[2] - n[2] * u[1], n[2] * u[0] - n[0] * u[2], n[0] * u[1] - n[1] * u[0] };
+            const float corners[6][2] = { {-1, -1}, {1, -1}, {1, 1}, {1, 1}, {-1, 1}, {-1, -1} };
+            for (const auto& c : corners)
+            {
+                for (int k = 0; k < 3; k++)
+                    cube.push_back(0.5f * n[k] + 0.5f * c[0] * u[k] + 0.5f * c[1] * v[k]);
+                for (int k = 0; k < 3; k++)
+                    cube.push_back(n[k]);
+            }
+        }
+        glGenVertexArrays(1, &s.lit_cube_vao);
+        glGenBuffers(1, &s.lit_cube_vbo);
+        glBindVertexArray(s.lit_cube_vao);
+        glBindBuffer(GL_ARRAY_BUFFER, s.lit_cube_vbo);
+        glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(cube.size() * sizeof(float)), cube.data(), GL_STATIC_DRAW);
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)0);
+        glEnableVertexAttribArray(1);
+        glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)(3 * sizeof(float)));
+        glBindVertexArray(0);
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+    }
 
     glUseProgram(s.panel_prog);
     glUniform1i(glGetUniformLocation(s.panel_prog, "u_panel"), 0);
@@ -745,7 +819,8 @@ bool create_actions()
         !make_action(XR_ACTION_TYPE_POSE_INPUT, "aim_pose", "Pointing ray", true, &s.aim_action) ||
         !make_action(XR_ACTION_TYPE_FLOAT_INPUT, "select", "Pick up / dig (left click)", true, &s.select_action) ||
         !make_action(XR_ACTION_TYPE_BOOLEAN_INPUT, "hand_action", "Drop / slap (right click)", true, &s.hand_action) ||
-        !make_action(XR_ACTION_TYPE_BOOLEAN_INPUT, "toggle_panel", "Show / hide the wrist panel", false, &s.panel_toggle_action))
+        !make_action(XR_ACTION_TYPE_BOOLEAN_INPUT, "toggle_panel", "Show / hide the wrist panel", false, &s.panel_toggle_action) ||
+        !make_action(XR_ACTION_TYPE_VECTOR2F_INPUT, "scroll", "Scroll the dungeon", false, &s.scroll_action))
         return false;
 
     const char* const profiles[] = {
@@ -766,6 +841,7 @@ bool create_actions()
             {s.select_action,   to_path("/user/hand/right/input/trigger/value")},
             {s.hand_action,     to_path("/user/hand/right/input/a/click")},
             {s.panel_toggle_action, to_path("/user/hand/left/input/thumbstick/click")},
+            {s.scroll_action,   to_path("/user/hand/left/input/thumbstick")},
         };
         XrInteractionProfileSuggestedBinding suggested = {XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
         suggested.interactionProfile = to_path(profile);
@@ -901,6 +977,8 @@ void destroy_xr()
     s.action_set = XR_NULL_HANDLE;
     s.pose_action = s.grip_action = s.recenter_action = XR_NULL_HANDLE;
     s.aim_action = s.select_action = s.hand_action = s.panel_toggle_action = XR_NULL_HANDLE;
+    s.scroll_action = XR_NULL_HANDLE;
+    s.scroll_x = s.scroll_y = 0.0f;
     s.hand_spaces[0] = s.hand_spaces[1] = XR_NULL_HANDLE;
     s.aim_spaces[0] = s.aim_spaces[1] = XR_NULL_HANDLE;
     for (Hand& hand : s.hands)
@@ -932,6 +1010,10 @@ void destroy_gl()
     if (s.panel_fbo) glDeleteFramebuffers(1, &s.panel_fbo);
     if (s.panel_tex) glDeleteTextures(1, &s.panel_tex);
     if (s.panel_prog) glDeleteProgram(s.panel_prog);
+    if (s.lit_cube_vbo) glDeleteBuffers(1, &s.lit_cube_vbo);
+    if (s.lit_cube_vao) glDeleteVertexArrays(1, &s.lit_cube_vao);
+    if (s.lit_prog) glDeleteProgram(s.lit_prog);
+    s.lit_cube_vbo = s.lit_cube_vao = s.lit_prog = 0;
     s.panel_fbo = s.panel_tex = s.panel_prog = 0;
     s.panel_w = s.panel_h = 0;
     s.panel_ready = false;
@@ -1259,7 +1341,29 @@ void update_table_grab()
     }
 }
 
-void update_input(XrTime time)
+/** Left thumbstick: slides the dungeon under you, like scrolling the camera.
+ *  Push forward to move forward over the map; the response is gentle near
+ *  the centre and speeds up towards full deflection. */
+void update_table_scroll(float dt)
+{
+    if (s.grab_mask != 0 || dt <= 0.0f)
+        return;  // a grab is moving the table already
+    constexpr float k_deadzone = 0.15f;
+    constexpr float k_speed = 0.6f;  // metres per second at the default size, full deflection
+    const float mag = std::sqrt(s.scroll_x * s.scroll_x + s.scroll_y * s.scroll_y);
+    if (mag <= k_deadzone)
+        return;
+    const float eased = (mag - k_deadzone) / (1.0f - k_deadzone);
+    const float gain = eased * eased / mag;
+    // Faster when the table is bigger, so the dungeon passes at the same rate.
+    const float speed = k_speed * (s.table_scale / k_default_scale) * dt;
+    const Vec3 fwd = s.head_forward;
+    const Vec3 right = { -fwd.z, 0.0f, fwd.x };
+    const Vec3 move = (fwd * (s.scroll_y * gain) + right * (s.scroll_x * gain)) * speed;
+    s.table_pos = s.table_pos - move;
+}
+
+void update_input(XrTime time, float dt)
 {
     for (Hand& hand : s.hands)
     {
@@ -1268,6 +1372,7 @@ void update_input(XrTime time)
         hand.trigger = 0.0f;
         hand.action = false;
     }
+    s.scroll_x = s.scroll_y = 0.0f;
     if (s.action_set == XR_NULL_HANDLE || s.session_state != XR_SESSION_STATE_FOCUSED)
     {
         update_table_grab();
@@ -1325,7 +1430,16 @@ void update_input(XrTime time)
         toggle.isActive && toggle.changedSinceLastSync && toggle.currentState)
         s.panel_hidden = !s.panel_hidden;
 
+    get.action = s.scroll_action;
+    XrActionStateVector2f stick = {XR_TYPE_ACTION_STATE_VECTOR2F};
+    if (XR_SUCCEEDED(xrGetActionStateVector2f(s.session, &get, &stick)) && stick.isActive)
+    {
+        s.scroll_x = stick.currentState.x;
+        s.scroll_y = stick.currentState.y;
+    }
+
     update_table_grab();
+    update_table_scroll(dt);
 }
 
 /** Game units -> reference space; same as table_model() applied to a point. */
@@ -1450,6 +1564,83 @@ void draw_sprites(const Mat4& mvp, const GLWorldViewRenderer::VRTextures& tex)
     glBindVertexArray(0);
 }
 
+void draw_lit_box(const Mat4& view_proj, const Mat4& model, float r, float g, float b)
+{
+    const Mat4 mvp = view_proj * model;
+    glUniformMatrix4fv(s.loc_lit_mvp, 1, GL_FALSE, mvp.m);
+    glUniformMatrix4fv(s.loc_lit_model, 1, GL_FALSE, model.m);
+    glUniform4f(s.loc_lit_color, r, g, b, 1.0f);
+    glDrawArrays(GL_TRIANGLES, 0, 36);
+}
+
+/** The Keeper's hand, built from boxes at the controller's grip position.
+ *  It is turned like the aim pose (the laser): -Z forward along the
+ *  controller, +Y up, and for the right hand the palm faces -X. The grip
+ *  pose's own axes do not follow the controller that way on every runtime.
+ *  The index finger curls with the trigger, the other fingers and thumb with
+ *  the grip, so squeezing makes a fist. */
+void draw_keeper_hand(const Mat4& view_proj, const Hand& hand)
+{
+    // Pale, slightly sickly skin, dark claws, a crimson sleeve.
+    constexpr float skin[3]   = { 0.80f, 0.68f, 0.58f };
+    constexpr float claw[3]   = { 0.22f, 0.10f, 0.08f };
+    constexpr float sleeve[3] = { 0.45f, 0.08f, 0.10f };
+    const float index_curl = hand.trigger;
+    const float fist_curl = hand.grip;
+
+    glUseProgram(s.lit_prog);
+    const float light_len = std::sqrt(0.3f * 0.3f + 0.9f * 0.9f + 0.4f * 0.4f);
+    glUniform3f(s.loc_lit_light, 0.3f / light_len, 0.9f / light_len, 0.4f / light_len);
+    glBindVertexArray(s.lit_cube_vao);
+
+    const Mat4 grip = Mat4::FromPose(hand.aim_tracked ? hand.aim_rot : hand.rot, hand.pos);
+    // Back of the hand sits just outside the controller handle.
+    const Mat4 palm = grip * Mat4::Translation({0.034f, 0.0f, 0.004f});
+    draw_lit_box(view_proj, palm * Mat4::Scale({0.022f, 0.074f, 0.084f}), skin[0], skin[1], skin[2]);
+    draw_lit_box(view_proj, palm * Mat4::Translation({0.002f, 0.0f, 0.062f}) * Mat4::Scale({0.034f, 0.064f, 0.05f}),
+                 sleeve[0], sleeve[1], sleeve[2]);
+
+    // Fingers, index on top (+Y) down to the little finger.
+    const float finger_y[4] = { 0.027f, 0.009f, -0.009f, -0.026f };
+    const float finger_len[4] = { 0.95f, 1.0f, 0.93f, 0.76f };
+    const float segment_len[3] = { 0.040f, 0.026f, 0.020f };
+    const float joint_bend[3] = { 1.25f, 1.45f, 1.0f };   // radians at a full curl
+    constexpr float k_rest_curl = 0.08f;                  // a relaxed, nearly straight hand
+    for (int f = 0; f < 4; f++)
+    {
+        const float curl = (f == 0) ? index_curl : fist_curl;
+        Mat4 m = palm * Mat4::Translation({-0.002f, finger_y[f], -0.042f});
+        for (int j = 0; j < 3; j++)
+        {
+            const float len = segment_len[j] * finger_len[f];
+            m = m * Mat4::RotationY(joint_bend[j] * curl + k_rest_curl);
+            const float width = 0.017f - 0.002f * (float)j;
+            draw_lit_box(view_proj, m * Mat4::Translation({0.0f, 0.0f, -len * 0.5f}) * Mat4::Scale({width, width, len}),
+                         skin[0], skin[1], skin[2]);
+            m = m * Mat4::Translation({0.0f, 0.0f, -len});
+        }
+        // A short claw past the fingertip, bending on towards the palm.
+        const Mat4 tip = m * Mat4::RotationY(0.5f);
+        draw_lit_box(view_proj, tip * Mat4::Translation({0.0f, 0.0f, -0.006f}) * Mat4::Scale({0.008f, 0.01f, 0.014f}),
+                     claw[0], claw[1], claw[2]);
+    }
+
+    // Thumb: from the top of the palm, along the controller's face.
+    Mat4 thumb = palm * Mat4::Translation({-0.010f, 0.038f, -0.006f})
+               * Mat4::RotationY(0.45f + 0.55f * fist_curl) * Mat4::RotationX(0.25f);
+    const float thumb_len[2] = { 0.032f, 0.026f };
+    for (int j = 0; j < 2; j++)
+    {
+        draw_lit_box(view_proj, thumb * Mat4::Translation({0.0f, 0.0f, -thumb_len[j] * 0.5f}) * Mat4::Scale({0.019f, 0.019f, thumb_len[j]}),
+                     skin[0], skin[1], skin[2]);
+        thumb = thumb * Mat4::Translation({0.0f, 0.0f, -thumb_len[j]}) * Mat4::RotationY(0.35f * fist_curl + 0.1f);
+    }
+    draw_lit_box(view_proj, thumb * Mat4::Translation({0.0f, 0.0f, -0.006f}) * Mat4::Scale({0.009f, 0.011f, 0.013f}),
+                 claw[0], claw[1], claw[2]);
+
+    glBindVertexArray(0);
+}
+
 void draw_eye(const EyeTarget& eye, const Mat4& view_proj, const GLWorldViewRenderer::VRTextures& tex)
 {
     glViewport(0, 0, eye.w, eye.h);
@@ -1517,12 +1708,16 @@ void draw_eye(const EyeTarget& eye, const Mat4& view_proj, const GLWorldViewRend
         glBindTexture(GL_TEXTURE_2D_ARRAY, 0);
     }
 
-    // Controller markers: a small block per hand, green while grabbing.
+    // The Keeper's hand on the right controller.
+    if (s.hands[1].tracked)
+        draw_keeper_hand(view_proj, s.hands[1]);
+
+    // Left controller marker: a small block, green while grabbing.
     glUseProgram(s.solid_prog);
     glBindVertexArray(s.cube_vao);
     for (const Hand& hand : s.hands)
     {
-        if (!hand.tracked)
+        if (!hand.tracked || &hand == &s.hands[1])
             continue;
         const Mat4 mvp = view_proj * Mat4::FromPose(hand.rot, hand.pos) * Mat4::Scale({0.03f, 0.03f, 0.09f});
         glUniformMatrix4fv(s.loc_solid_mvp, 1, GL_FALSE, mvp.m);
@@ -1549,7 +1744,7 @@ void draw_eye(const EyeTarget& eye, const Mat4& view_proj, const GLWorldViewRend
     // Pointing ray from the right controller, ending in a marker where it meets
     // the dungeon or the panel. Brighter while the trigger is held.
     const Hand& pointer = s.hands[1];
-    if (s_pointer_in.valid && pointer.aim_tracked)
+    if (s_pointer_in.valid && s.ray_valid)
     {
         float length = 2.0f;
         Vec3 hit_stage = {0, 0, 0};
@@ -1559,10 +1754,11 @@ void draw_eye(const EyeTarget& eye, const Mat4& view_proj, const GLWorldViewRend
         else if (s_pointer_out.hit)
             hit_stage = game_to_stage({s_pointer_out.x, s_pointer_out.y, s_pointer_out.z});
         if (ends)
-            length = Length(hit_stage - pointer.aim_pos);
+            length = Length(hit_stage - s.ray_origin);
         const float glow = s_pointer_in.select ? 1.0f : 0.6f;
-        const Mat4 ray = view_proj * Mat4::FromPose(pointer.aim_rot, pointer.aim_pos)
-                       * Mat4::Translation({0, 0, -length * 0.5f}) * Mat4::Scale({0.003f, 0.003f, length});
+        // Along the hand's -X (out of the palm), see render_views().
+        const Mat4 ray = view_proj * Mat4::FromPose(pointer.aim_rot, s.ray_origin)
+                       * Mat4::Translation({-length * 0.5f, 0, 0}) * Mat4::Scale({length, 0.003f, 0.003f});
         glUniformMatrix4fv(s.loc_solid_mvp, 1, GL_FALSE, ray.m);
         glUniform4f(s.loc_solid_color, 0.9f * glow, 0.25f * glow, 0.15f * glow, 1.0f);
         glDrawArrays(GL_TRIANGLES, 0, 36);
@@ -1607,8 +1803,14 @@ bool render_views(GLWorldViewRenderer& world, XrTime time,
     s_things.viewer_valid = true;
     build_sprite_vertices(viewer);
 
+    // Horizontal facing, for thumbstick scrolling.
+    const Vec3 gaze = Rotate(to_quat(views[0].pose.orientation), {0, 0, -1});
+    const float flat = std::sqrt(gaze.x * gaze.x + gaze.z * gaze.z);
+    if (flat > 0.1f)
+        s.head_forward = { gaze.x / flat, 0.0f, gaze.z / flat };
+
     // Head gaze for the sound listener.
-    const Vec3 gaze_ahead = stage_to_game(head + Rotate(to_quat(views[0].pose.orientation), {0, 0, -1}));
+    const Vec3 gaze_ahead = stage_to_game(head + gaze);
     s_head_in.valid = true;
     s_head_in.ox = viewer.x; s_head_in.oy = viewer.y; s_head_in.oz = viewer.z;
     s_head_in.dx = gaze_ahead.x - viewer.x; s_head_in.dy = gaze_ahead.y - viewer.y; s_head_in.dz = gaze_ahead.z - viewer.z;
@@ -1616,16 +1818,22 @@ bool render_views(GLWorldViewRenderer& world, XrTime time,
     // The right controller's pointing ray, in game units, for the game thread.
     const Hand& pointer = s.hands[1];
     PointerInput in;
-    s.panel_shown = !s.panel_hidden && s.in_level && place_panel(head);
-    if (pointer.aim_tracked && s.panel_shown)
+    // The ray comes straight out of the palm of the Keeper's hand (turned like
+    // the aim pose, palm towards -X), so a palm-down hand points straight down
+    // at what is under it, without bending the wrist.
+    s.ray_valid = pointer.aim_tracked && pointer.tracked;
+    if (s.ray_valid)
     {
-        const Vec3 ray_dir = Rotate(pointer.aim_rot, {0, 0, -1});
-        in.panel_hit = ray_hits_panel(pointer.aim_pos, ray_dir, &in.panel_u, &in.panel_v, &s.panel_pointer);
+        s.ray_origin = pointer.pos + Rotate(pointer.aim_rot, {0.022f, 0.0f, 0.004f});
+        s.ray_dir = Rotate(pointer.aim_rot, {-1.0f, 0.0f, 0.0f});
     }
-    if (pointer.aim_tracked && s.in_level)
+    s.panel_shown = !s.panel_hidden && s.in_level && place_panel(head);
+    if (s.ray_valid && s.panel_shown)
+        in.panel_hit = ray_hits_panel(s.ray_origin, s.ray_dir, &in.panel_u, &in.panel_v, &s.panel_pointer);
+    if (s.ray_valid && s.in_level)
     {
-        const Vec3 origin = stage_to_game(pointer.aim_pos);
-        const Vec3 ahead = stage_to_game(pointer.aim_pos + Rotate(pointer.aim_rot, {0, 0, -1}));
+        const Vec3 origin = stage_to_game(s.ray_origin);
+        const Vec3 ahead = stage_to_game(s.ray_origin + s.ray_dir);
         in.valid = true;
         in.ox = origin.x; in.oy = origin.y; in.oz = origin.z;
         in.dx = ahead.x - origin.x; in.dy = ahead.y - origin.y; in.dz = ahead.z - origin.z;
@@ -1816,7 +2024,9 @@ void RenderThreadFrame(GLWorldViewRenderer& world, unsigned int screen_fbo, int 
     if (!xr_ok(xrBeginFrame(s.session, &begin_info), "xrBeginFrame"))
         return;
 
-    update_input(frame_state.predictedDisplayTime);
+    // predictedDisplayPeriod is the frame time in nanoseconds; capped so a stall does not jump the table.
+    const float dt = std::fmin((float)frame_state.predictedDisplayPeriod * 1e-9f, 0.05f);
+    update_input(frame_state.predictedDisplayTime, dt);
 
     XrCompositionLayerProjection layer = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
     XrCompositionLayerProjectionView proj_views[2];
