@@ -1280,6 +1280,10 @@ void process_cmdline_overrides(void)
   if (start_params.overrides[Clo_CDMusic]) {
     features_enabled &= ~Ft_NoCdMusic;
   }
+  // Renderer chosen on the command line (-opengl, -vr) wins over RENDERER in the config
+  if (start_params.overrides[Clo_Renderer]) {
+    requested_renderer_type = start_params.renderer_type;
+  }
 }
 
 int parse_draw_fps_config_val(const char *arg, int32_t *fps_draw_main, int32_t *fps_draw_secondary)
