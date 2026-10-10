@@ -1,0 +1,25 @@
+#include <winuser.h>
+1 ICON "../../res/keeperfx_icon.ico"
+1 RT_MANIFEST "launcher.manifest"
+
+1 VERSIONINFO
+FILEVERSION 1,0,0,0
+PRODUCTVERSION 1,0,0,0
+FILEOS 0x40004
+FILETYPE 0x1
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040904B0"
+    BEGIN
+      VALUE "FileDescription", "KeeperFX VR launcher"
+      VALUE "ProductName", "KeeperFX VR"
+      VALUE "FileVersion", "1.0"
+      VALUE "OriginalFilename", "KeeperFX VR.exe"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x409, 1200
+  END
+END
