@@ -1945,6 +1945,10 @@ void update_cancel_button(Vec3 head, const Hand& hand)
     if (over && depth < 0.012f && s.cancel_armed)
     {
         s_cancel_request = true;
+        // Done with tools for now: keep the wrist panel folded away (it would
+        // otherwise come back with the plain hand). The thumbstick click shows it.
+        s.panel_hidden = true;
+        s.panel_auto_hidden = false;
         s.cancel_armed = false;
         s.cancel_flash = 0.35f;
         buzz(1, 0.6f, 0.04f);
