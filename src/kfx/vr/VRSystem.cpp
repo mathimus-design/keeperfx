@@ -443,6 +443,7 @@ struct State {
     XrAction pose_action = XR_NULL_HANDLE;
     XrAction grip_action = XR_NULL_HANDLE;
     XrAction recenter_action = XR_NULL_HANDLE;
+    XrAction laser_toggle_action = XR_NULL_HANDLE;  // right B: laser from the palm or the front
     XrAction aim_action = XR_NULL_HANDLE;
     XrAction select_action = XR_NULL_HANDLE;
     XrAction hand_action = XR_NULL_HANDLE;
@@ -1007,6 +1008,34 @@ bool create_swapchains()
     return true;
 }
 
+/** Where the player's VR choices are kept: vrr.ini next to the VR build
+ *  (the game runs from the KeeperFX folder), else keeperfx_vr.ini there. */
+std::string settings_path()
+{
+    const DWORD a = GetFileAttributesA("vr");
+    const char* const name = (a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY)) ? "vr\\vr.ini" : "keeperfx_vr.ini";
+    char full[MAX_PATH];
+    return GetFullPathNameA(name, MAX_PATH, full, nullptr) ? std::string(full) : std::string(name);
+}
+
+/** The laser comes out of the palm (pointing down), or with right B from the
+ *  front of the controller, like the forward ray with the panel open. Remembered. */
+int s_laser_front = -1;  // -1: not read yet
+
+bool laser_front()
+{
+    if (s_laser_front < 0)
+        s_laser_front = GetPrivateProfileIntA("vr", "laser_front", 0, settings_path().c_str()) ? 1 : 0;
+    return s_laser_front == 1;
+}
+
+void set_laser_front(bool front)
+{
+    s_laser_front = front ? 1 : 0;
+    WritePrivateProfileStringA("vr", "laser_front", front ? "1" : "0", settings_path().c_str());
+    SYNCLOG("VR: laser now points %s", front ? "from the front of the controller" : "down from the palm");
+}
+
 bool create_actions()
 {
     XrActionSetCreateInfo set_info = {XR_TYPE_ACTION_SET_CREATE_INFO};
@@ -1033,6 +1062,7 @@ bool create_actions()
     if (!make_action(XR_ACTION_TYPE_POSE_INPUT, "hand_pose", "Hand pose", true, &s.pose_action) ||
         !make_action(XR_ACTION_TYPE_FLOAT_INPUT, "grab_table", "Grab the dungeon", true, &s.grip_action) ||
         !make_action(XR_ACTION_TYPE_BOOLEAN_INPUT, "recenter", "Recenter the dungeon", false, &s.recenter_action) ||
+        !make_action(XR_ACTION_TYPE_BOOLEAN_INPUT, "laser_toggle", "Laser from the palm / the front", false, &s.laser_toggle_action) ||
         !make_action(XR_ACTION_TYPE_POSE_INPUT, "aim_pose", "Pointing ray", true, &s.aim_action) ||
         !make_action(XR_ACTION_TYPE_FLOAT_INPUT, "select", "Pick up / dig (left click)", true, &s.select_action) ||
         !make_action(XR_ACTION_TYPE_BOOLEAN_INPUT, "hand_action", "Drop / slap (right click)", true, &s.hand_action) ||
@@ -1072,6 +1102,7 @@ bool create_actions()
             {s.grip_action,     to_path(grip_paths[p][0])},
             {s.grip_action,     to_path(grip_paths[p][1])},
             {s.recenter_action, to_path("/user/hand/right/input/thumbstick/click")},
+            {s.laser_toggle_action, to_path("/user/hand/right/input/b/click")},
             {s.aim_action,      to_path("/user/hand/left/input/aim/pose")},
             {s.aim_action,      to_path("/user/hand/right/input/aim/pose")},
             {s.select_action,   to_path("/user/hand/left/input/trigger/value")},
@@ -1215,7 +1246,7 @@ void destroy_xr()
     s.running = false;
     s.space = s.view_space = XR_NULL_HANDLE;
     s.action_set = XR_NULL_HANDLE;
-    s.pose_action = s.grip_action = s.recenter_action = XR_NULL_HANDLE;
+    s.pose_action = s.grip_action = s.recenter_action = s.laser_toggle_action = XR_NULL_HANDLE;
     s.aim_action = s.select_action = s.hand_action = s.panel_toggle_action = XR_NULL_HANDLE;
     s.scroll_action = s.turn_action = s.haptic_action = s.pause_action = XR_NULL_HANDLE;
     s.scroll_x = s.scroll_y = s.turn_x = 0.0f;
@@ -2662,6 +2693,15 @@ void update_input(XrTime time, float dt)
             s.table_placed = false;
     }
 
+    get.action = s.laser_toggle_action;
+    XrActionStateBoolean laser = {XR_TYPE_ACTION_STATE_BOOLEAN};
+    if (XR_SUCCEEDED(xrGetActionStateBoolean(s.session, &get, &laser)) &&
+        laser.isActive && laser.changedSinceLastSync && laser.currentState)
+    {
+        set_laser_front(!laser_front());
+        buzz(1, 0.5f, 0.05f);
+    }
+
     get.action = s.panel_toggle_action;
     XrActionStateBoolean toggle = {XR_TYPE_ACTION_STATE_BOOLEAN};
     if (XR_SUCCEEDED(xrGetActionStateBoolean(s.session, &get, &toggle)) &&
@@ -3491,7 +3531,7 @@ bool render_views(GLWorldViewRenderer& world, XrTime time,
                       && !s_things.palm.empty();
     s.panel_shown = !s.panel_hidden && s.in_level && !s.possessing && !palm_up && place_panel(head);
     s.ray_valid = pointer.aim_tracked && pointer.tracked && !s.possessing;
-    s.ray_forward = s.panel_shown;
+    s.ray_forward = s.panel_shown || laser_front();
     if (s.ray_valid && s.ray_forward)
     {
         s.ray_origin = pointer.aim_pos;
