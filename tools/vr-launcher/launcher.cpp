@@ -407,14 +407,14 @@ void build_ui(HWND wnd)
     make(wnd, L"STATIC", ver.c_str(), SS_LEFT, 18, y + 32, 420, 18, 0, nullptr);
     y += 60;
 
-    make(wnd, L"BUTTON", L"Setup", BS_GROUPBOX, 12, y, 436, 24 + 40 * (int)g_checks.size(), 0, g_bold);
+    make(wnd, L"BUTTON", L"Setup", BS_GROUPBOX, 12, y, 436, 26 + 50 * (int)g_checks.size(), 0, g_bold);
     y += 22;
     for (const Check& c : g_checks)
     {
         make(wnd, L"STATIC", c.ok ? L"\u2714" : L"\u2716", SS_CENTER, 22, y, 18, 18, c.ok ? 1 : 2, g_bold);
         make(wnd, L"STATIC", c.label.c_str(), SS_LEFT, 44, y, 390, 18, 0, g_bold);
-        make(wnd, L"STATIC", c.detail.c_str(), SS_LEFT, 44, y + 17, 396, 20, 0, nullptr);
-        y += 40;
+        make(wnd, L"STATIC", c.detail.c_str(), SS_LEFT, 44, y + 17, 396, 32, 0, nullptr);  // up to two lines
+        y += 50;
     }
     y += 14;
 
