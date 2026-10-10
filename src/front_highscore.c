@@ -41,6 +41,7 @@
 #include "gui_frontbtns.h"
 #include "custom_sprites.h"
 #include "highscores.h"
+#include "kfx/vr/VR.h"
 #include "post_inc.h"
 
 /******************************************************************************/
@@ -197,6 +198,12 @@ TbBool frontend_high_score_table_input(void)
     }
     if (!LbIsTextInputActive())
         LbStartTextInput();
+    // VR: A confirms the name (the default one, unless typed on the PC).
+    if (VR_ConsumeEnterRequest())
+    {
+        finalize_high_score_entry(false);
+        return true;
+    }
     if (lbInkey == KC_BACK)
     {
         // Delete previous character

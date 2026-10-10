@@ -573,6 +573,13 @@ struct State {
     float info_button_flash = 0;
     bool panel_finger = false;              // the index fingertip is on the panel
     bool panel_touching = false;            // ... and pushed into it
+    // A tap on the panel, held long enough for the game to see and kept on
+    // the spot where it began (see the panel touch in RenderThreadFrame()).
+    bool panel_tap = false;
+    bool enter_was_down = false;
+    bool panel_tap_down = false;
+    float panel_tap_u = 0, panel_tap_v = 0;
+    float panel_tap_hold = 0, panel_tap_after = 0;
     bool panel_was_pressed = false;         // last frame, to catch a new press
     float panel_flash_time = 0;             // seconds of the press flash left
 
@@ -656,6 +663,10 @@ bool s_level_decided = false;
 bool s_finish_request = false;
 /** The "back to the hand" button was pressed (render -> game). */
 bool s_cancel_request = false;
+/** A pressed on a menu screen (render -> game), and until when the game
+ *  thread's copy counts, so a stale press does not confirm a later name. */
+bool s_enter_request = false;
+ULONGLONG s_enter_pending_until = 0;
 bool s_finish_pending = false;
 
 /** Slapping with the hand: where the right palm is over the map and whether
@@ -3455,6 +3466,11 @@ bool render_views(GLWorldViewRenderer& world, XrTime time,
             buzz(1, 0.7f, 0.06f);
         }
         s.finish_was_down = down;
+        // A on a menu screen: Enter, to confirm a high score name (the game
+        // fills in a default name; there is no keyboard in VR).
+        if (s.menu_shown && !s.in_level && s.hands[1].action && !s.enter_was_down)
+            s_enter_request = true;
+        s.enter_was_down = s.hands[1].action;
     }
     const Vec3 viewer = stage_to_game(head);
     s_things.viewer_x = viewer.x;
@@ -3540,8 +3556,17 @@ bool render_views(GLWorldViewRenderer& world, XrTime time,
         float u, v, depth;
         if (panel_coords(tip, &u, &v, &depth) && depth < 0.08f && depth > -0.06f)
         {
+            const bool was_touching = s.panel_touching;
             if (s.panel_touching ? (depth > 0.015f) : (depth < 0.004f))
                 s.panel_touching = !s.panel_touching;
+            if (s.panel_touching && !was_touching && !s.panel_tap)
+            {
+                s.panel_tap = true;
+                s.panel_tap_u = u;
+                s.panel_tap_v = v;
+                s.panel_tap_hold = 0.12f;
+                s.panel_tap_after = 0.08f;
+            }
             s.panel_finger = true;
             in.panel_hit = true;
             in.panel_u = u;
@@ -3557,6 +3582,34 @@ bool render_views(GLWorldViewRenderer& world, XrTime time,
     else
     {
         s.panel_touching = false;
+    }
+    // A tap: the game reads the mouse once per frame of its own and clicks a
+    // button on release over the same button, so a quick poke, or one that
+    // slides while pushing in, used to miss. Hold the press for at least
+    // ~0.12 s and keep the cursor where it began until just after release.
+    s.panel_tap_down = false;
+    if (s.panel_tap)
+    {
+        s.panel_tap_hold -= s.frame_dt;
+        const bool down = s.panel_touching || s.panel_tap_hold > 0.0f;
+        if (!down)
+            s.panel_tap_after -= s.frame_dt;
+        if (!down && s.panel_tap_after <= 0.0f)
+        {
+            s.panel_tap = false;
+        }
+        else if (s.panel_shown)
+        {
+            s.panel_tap_down = down;
+            s.panel_finger = true;
+            in.panel_hit = true;
+            in.panel_u = s.panel_tap_u;
+            in.panel_v = s.panel_tap_v;
+        }
+        else
+        {
+            s.panel_tap = false;
+        }
     }
     s.ray_rot = pointer.aim_rot;
     // A spell is chosen: the left hand casts it, forward along the controller,
@@ -3594,7 +3647,7 @@ bool render_views(GLWorldViewRenderer& world, XrTime time,
         in.dx = ahead.x - origin.x; in.dy = ahead.y - origin.y; in.dz = ahead.z - origin.z;
         if (s_select_held ? (ray_hand.trigger < 0.35f) : (ray_hand.trigger > 0.6f))
             s_select_held = !s_select_held;
-        in.select = s.panel_finger ? s.panel_touching : s_select_held;
+        in.select = s.panel_finger ? s.panel_tap_down : s_select_held;
         in.action = pointer.action;
     }
     else if (s.possessing && s.in_level)
@@ -3756,6 +3809,11 @@ void GameThreadSync()
     {
         s_pause_request = false;
         s_pause_pending = true;  // taken by the input code via VR_ConsumePauseRequest()
+    }
+    if (s_enter_request)
+    {
+        s_enter_request = false;
+        s_enter_pending_until = GetTickCount64() + 600;  // taken by VR_ConsumeEnterRequest()
     }
 
     UpdateDungeonSnapshot(s_snapshot);
@@ -3985,6 +4043,15 @@ int VR_ConsumeFinishRequest(void)
     return 1;
 }
 
+int VR_ConsumeEnterRequest(void)
+{
+    if (!vr_requested || VR::s_enter_pending_until == 0)
+        return 0;
+    const bool fresh = GetTickCount64() < VR::s_enter_pending_until;
+    VR::s_enter_pending_until = 0;
+    return fresh ? 1 : 0;
+}
+
 int VR_ConsumeSlapTarget(void)
 {
     if (!vr_requested || VR::s_slap_pending <= 0)
@@ -4033,6 +4100,7 @@ int VR_IsHeadsetActive(void) { return 0; }
 int VR_ConsumePauseRequest(void) { return 0; }
 int VR_ConsumeSlapTarget(void) { return 0; }
 int VR_ConsumeFinishRequest(void) { return 0; }
+int VR_ConsumeEnterRequest(void) { return 0; }
 int VR_GetPossessionControls(int*, int*, int*, int*) { return 0; }
 
 #include "post_inc.h"

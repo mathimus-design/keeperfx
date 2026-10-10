@@ -49,6 +49,10 @@ int VR_ConsumeSlapTarget(void);
  *  finish-level key (space). */
 int VR_ConsumeFinishRequest(void);
 
+/** Game thread: non-zero once after A was pressed on a menu screen; the high
+ *  score table then takes it as Enter, to confirm the name being typed. */
+int VR_ConsumeEnterRequest(void);
+
 #ifdef __cplusplus
 }
 #endif
