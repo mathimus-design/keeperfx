@@ -536,6 +536,13 @@ struct State {
     bool info_ready = false;                // copied this frame
     bool info_shown = false;                // drawn this frame
     bool info_hidden = false;               // hidden with the button on the panel
+    // "Back to the hand" button, shown while a room / spell / trap... is chosen.
+    bool cancel_shown = false;
+    bool cancel_hover = false;
+    bool cancel_armed = true;
+    float cancel_flash = 0;
+    Vec3 cancel_center = {0, 0, 0};
+    Vec3 cancel_right = {1, 0, 0}, cancel_up = {0, 1, 0}, cancel_normal = {0, 0, 1};
     Vec3 info_center = {0, 0, 0};
     Vec3 info_right = {1, 0, 0}, info_up = {0, 1, 0}, info_normal = {0, 0, 1};
     float info_world_w = 0, info_world_h = 0;
@@ -647,6 +654,8 @@ bool s_pause_pending = false;
  *  continue (render -> game), taken once by the input code. */
 bool s_level_decided = false;
 bool s_finish_request = false;
+/** The "back to the hand" button was pressed (render -> game). */
+bool s_cancel_request = false;
 bool s_finish_pending = false;
 
 /** Slapping with the hand: where the right palm is over the map and whether
@@ -1034,6 +1043,13 @@ bool create_actions()
         { "/user/hand/left/input/menu/click", "/user/hand/left/input/y/click" },
         { "/user/hand/left/input/b/click",    "/user/hand/left/input/a/click" },
     };
+    // Grip: the Index's squeeze value follows the fingers resting on the grip,
+    // so just holding the controller reads as gripping; its force sensor needs
+    // an actual squeeze.
+    const char* const grip_paths[][2] = {
+        { "/user/hand/left/input/squeeze/value", "/user/hand/right/input/squeeze/value" },
+        { "/user/hand/left/input/squeeze/force", "/user/hand/right/input/squeeze/force" },
+    };
     for (size_t p = 0; p < sizeof(profiles) / sizeof(profiles[0]); p++)
     {
         const char* const profile = profiles[p];
@@ -1042,8 +1058,8 @@ bool create_actions()
             {s.pause_action,    to_path(pause_paths[p][1])},
             {s.pose_action,     to_path("/user/hand/left/input/grip/pose")},
             {s.pose_action,     to_path("/user/hand/right/input/grip/pose")},
-            {s.grip_action,     to_path("/user/hand/left/input/squeeze/value")},
-            {s.grip_action,     to_path("/user/hand/right/input/squeeze/value")},
+            {s.grip_action,     to_path(grip_paths[p][0])},
+            {s.grip_action,     to_path(grip_paths[p][1])},
             {s.recenter_action, to_path("/user/hand/right/input/thumbstick/click")},
             {s.aim_action,      to_path("/user/hand/left/input/aim/pose")},
             {s.aim_action,      to_path("/user/hand/right/input/aim/pose")},
@@ -1732,11 +1748,11 @@ MenuInput update_info_box(Vec3 head, const Hand& hand)
         s.info_normal = n;
     }
 
-    // Its own buttons, half as big again, in a centred row just under it.
+    // Its own buttons, twice as big, in a centred row just under it.
     s.info_btn_hover = -1;
     {
-        constexpr float k_btn_scale = 1.5f;
-        constexpr float k_btn_gap = 0.012f;
+        constexpr float k_btn_scale = 2.0f;
+        constexpr float k_btn_gap = 0.025f;
         float row_w = 0.0f, row_h = 0.0f;
         for (int i = 0; i < s.info_btn_count; i++)
         {
@@ -1752,30 +1768,65 @@ MenuInput update_info_box(Vec3 head, const Hand& hand)
             s.info_btn_center[i] = row_center + s.info_right * (x + s.info_btn_world_w[i] * 0.5f);
             x += s.info_btn_world_w[i] + k_btn_gap;
         }
-        if (hand.tracked && s.info_btn_count > 0)
-        {
-            const Vec3 tip = index_fingertip(hand);
+        // The button nearest the fingertip (or where the ray meets the row),
+        // with a generous margin around each so they are easy to hit.
+        auto nearest_button = [&](Vec3 at, float* out_depth) {
+            int best = -1;
+            float best_score = 1e9f;
             for (int i = 0; i < s.info_btn_count; i++)
             {
-                const Vec3 d = tip - s.info_btn_center[i];
+                const Vec3 d = at - s.info_btn_center[i];
                 const float du = d.x * s.info_right.x + d.y * s.info_right.y + d.z * s.info_right.z;
                 const float dv = d.x * s.info_up.x + d.y * s.info_up.y + d.z * s.info_up.z;
                 const float depth = d.x * s.info_normal.x + d.y * s.info_normal.y + d.z * s.info_normal.z;
-                if (std::fabs(du) < s.info_btn_world_w[i] * 0.6f && std::fabs(dv) < s.info_btn_world_h[i] * 0.6f
-                    && depth < 0.08f && depth > -0.06f)
+                const float hw = s.info_btn_world_w[i] * 0.5f + 0.012f, hh = s.info_btn_world_h[i] * 0.5f + 0.012f;
+                if (std::fabs(du) > hw || std::fabs(dv) > hh)
+                    continue;
+                const float score = std::fmax(std::fabs(du) / hw, std::fabs(dv) / hh);
+                if (score < best_score)
                 {
-                    // Pointing at the real button's middle; pushing in presses it.
-                    if (s.info_touching ? (depth > 0.015f) : (depth < 0.004f))
-                        s.info_touching = !s.info_touching;
-                    const InfoBoxInfo::Button& b = s_info_box.buttons[i];
-                    const float bw = s_info_box.x1 - s_info_box.x0, bh = s_info_box.y1 - s_info_box.y0;
-                    in.valid = true;
-                    in.u = ((b.x0 + b.x1) * 0.5f - s_info_box.x0) / bw;
-                    in.v = 1.0f - ((b.y0 + b.y1) * 0.5f - s_info_box.y0) / bh;
-                    in.press = s.info_touching;
-                    s.info_btn_hover = i;
-                    s.info_finger = true;
-                    break;
+                    best_score = score;
+                    best = i;
+                    *out_depth = depth;
+                }
+            }
+            return best;
+        };
+        auto press_button = [&](int i, bool press) {
+            const InfoBoxInfo::Button& b = s_info_box.buttons[i];
+            const float bw = s_info_box.x1 - s_info_box.x0, bh = s_info_box.y1 - s_info_box.y0;
+            in.valid = true;
+            in.u = ((b.x0 + b.x1) * 0.5f - s_info_box.x0) / bw;  // the real button's middle
+            in.v = 1.0f - ((b.y0 + b.y1) * 0.5f - s_info_box.y0) / bh;
+            in.press = press;
+            s.info_btn_hover = i;
+        };
+        if (hand.tracked && s.info_btn_count > 0)
+        {
+            float depth = 0.0f;
+            const int i = nearest_button(index_fingertip(hand), &depth);
+            if (i >= 0 && depth < 0.08f && depth > -0.06f)
+            {
+                // Pushing in presses it.
+                if (s.info_touching ? (depth > 0.015f) : (depth < 0.004f))
+                    s.info_touching = !s.info_touching;
+                press_button(i, s.info_touching);
+                s.info_finger = true;
+            }
+            else if (hand.aim_tracked)
+            {
+                // The forward ray on a button, with the trigger.
+                s.info_touching = false;
+                const Vec3 dir = Rotate(hand.aim_rot, {0.0f, 0.0f, -1.0f});
+                const float denom = dir.x * s.info_normal.x + dir.y * s.info_normal.y + dir.z * s.info_normal.z;
+                if (std::fabs(denom) > 1e-5f)
+                {
+                    const Vec3 to_center = s.info_center - hand.aim_pos;
+                    const float t = (to_center.x * s.info_normal.x + to_center.y * s.info_normal.y + to_center.z * s.info_normal.z) / denom;
+                    float ray_depth = 0.0f;
+                    const int j = (t > 0.0f && t < 1.5f) ? nearest_button(hand.aim_pos + dir * t, &ray_depth) : -1;
+                    if (j >= 0)
+                        press_button(j, hand.trigger > 0.6f);
                 }
             }
         }
@@ -1832,6 +1883,98 @@ MenuInput update_info_box(Vec3 head, const Hand& hand)
     }
     s.info_was_pressed = in.valid && in.press;
     return in;
+}
+
+constexpr float k_cancel_button = 0.04f;  // metres
+
+/** The "back to the hand" button: a red X at the panel's top-left corner, or
+ *  beside the left hand while the panel is folded away. Shown whenever a tool
+ *  (room, spell, trap, door, sell...) is chosen; tapping it drops the tool. */
+void update_cancel_button(Vec3 head, const Hand& hand)
+{
+    s.cancel_shown = s.in_level && !s.possessing && !s.menu_shown && !s_plain_hand && s.hands[0].tracked;
+    if (s.cancel_flash > 0.0f)
+        s.cancel_flash -= s.frame_dt;
+    if (!s.cancel_shown)
+    {
+        s.cancel_hover = false;
+        s.cancel_armed = true;
+        return;
+    }
+    if (s.panel_shown)
+    {
+        s.cancel_right = s.panel_right;
+        s.cancel_up = s.panel_up;
+        s.cancel_normal = s.panel_normal;
+        s.cancel_center = s.panel_center + s.panel_up * (s.panel_world_h * 0.5f + k_cancel_button * 0.7f)
+                        - s.panel_right * (s.panel_world_w * 0.5f - k_cancel_button * 0.5f);
+    }
+    else
+    {
+        const Vec3 base = s.hands[0].pos + Vec3{0.0f, 0.07f, 0.0f};
+        Vec3 n = head - base;
+        n = n * (1.0f / std::fmax(Length(n), 1e-4f));
+        Vec3 right = { n.z, 0.0f, -n.x };
+        right = right * (1.0f / std::fmax(Length(right), 1e-4f));
+        s.cancel_right = right;
+        s.cancel_up = { n.y * right.z - n.z * right.y, n.z * right.x - n.x * right.z, n.x * right.y - n.y * right.x };
+        s.cancel_normal = n;
+        // Left of the message box, which sits above the hand.
+        const float aside = s.info_shown ? s.info_world_w * 0.5f + k_cancel_button : 0.0f;
+        s.cancel_center = base - right * aside;
+    }
+    s.cancel_hover = false;
+    if (!hand.tracked)
+        return;
+    const Vec3 d = index_fingertip(hand) - s.cancel_center;
+    const float du = d.x * s.cancel_right.x + d.y * s.cancel_right.y + d.z * s.cancel_right.z;
+    const float dv = d.x * s.cancel_up.x + d.y * s.cancel_up.y + d.z * s.cancel_up.z;
+    const float depth = d.x * s.cancel_normal.x + d.y * s.cancel_normal.y + d.z * s.cancel_normal.z;
+    const bool over = std::fabs(du) < k_cancel_button * 0.75f && std::fabs(dv) < k_cancel_button * 0.75f && depth > -0.05f;
+    s.cancel_hover = over && depth < 0.06f;
+    if (over && depth < 0.012f && s.cancel_armed)
+    {
+        s_cancel_request = true;
+        s.cancel_armed = false;
+        s.cancel_flash = 0.35f;
+        buzz(1, 0.6f, 0.04f);
+    }
+    else if (!over || depth > 0.03f)
+    {
+        s.cancel_armed = true;
+    }
+}
+
+/** Draws the "back to the hand" button. Solid program and cube bound. */
+void draw_cancel_button(const Mat4& view_proj)
+{
+    if (!s.cancel_shown)
+        return;
+    const float grow = (s.cancel_flash > 0.0f) ? 1.25f : s.cancel_hover ? 1.12f : 1.0f;
+    const float size = k_cancel_button * grow;
+    auto plate = [&](Vec3 r, Vec3 u, float lift) {
+        Mat4 m = Mat4::Identity();
+        const Vec3 dz = s.cancel_normal * 0.003f;
+        const Vec3 at = s.cancel_center + s.cancel_normal * lift;
+        m.m[0] = r.x; m.m[1] = r.y; m.m[2] = r.z;
+        m.m[4] = u.x; m.m[5] = u.y; m.m[6] = u.z;
+        m.m[8] = dz.x; m.m[9] = dz.y; m.m[10] = dz.z;
+        m.m[12] = at.x; m.m[13] = at.y; m.m[14] = at.z;
+        const Mat4 mvp = view_proj * m;
+        glUniformMatrix4fv(s.loc_solid_mvp, 1, GL_FALSE, mvp.m);
+        glDrawArrays(GL_TRIANGLES, 0, 36);
+    };
+    if (s.cancel_flash > 0.0f)
+        glUniform4f(s.loc_solid_color, 0.45f, 1.0f, 0.45f, 1.0f);
+    else
+        glUniform4f(s.loc_solid_color, 0.80f, 0.12f, 0.10f, 1.0f);
+    plate(s.cancel_right * size, s.cancel_up * size, 0.0f);
+    // A white X: two bars along the diagonals.
+    const float k = 0.70710678f;
+    const Vec3 d1 = (s.cancel_right + s.cancel_up) * k, d2 = (s.cancel_right - s.cancel_up) * k;
+    glUniform4f(s.loc_solid_color, 0.95f, 0.92f, 0.85f, 1.0f);
+    plate(d1 * (size * 0.8f), d2 * (size * 0.16f), 0.003f);
+    plate(d2 * (size * 0.8f), d1 * (size * 0.16f), 0.003f);
 }
 
 /** New text: raise the alert when a message box opens or shows a different
@@ -3185,6 +3328,7 @@ void draw_eye(const EyeTarget& eye, const Mat4& view_proj, const GLWorldViewRend
         glUseProgram(s.solid_prog);
     }
     draw_info_box(view_proj);
+    draw_cancel_button(view_proj);
 
     // The fingertip on the wrist panel: an outline instead of the laser.
     if (s_pointer_in.valid && s.panel_finger)
@@ -3491,6 +3635,9 @@ bool render_views(GLWorldViewRenderer& world, XrTime time,
     // The message box beside the panel: its touch goes to the game in place
     // of the dungeon pointer (see GameThreadSync()).
     s_info_in = update_info_box(head, pointer);
+    update_cancel_button(head, pointer);
+    if (s.cancel_hover)
+        s.ray_valid = false;
     if (s_info_in.valid)
         s.ray_valid = false;
     update_text_alert(head_gaze);
@@ -3662,6 +3809,12 @@ void GameThreadSync()
         {
             s_finish_request = false;
             s_finish_pending = true;  // taken by VR_ConsumeFinishRequest()
+        }
+        if (s_cancel_request)
+        {
+            s_cancel_request = false;
+            if (!PlainHand())
+                ReturnToHand();  // the red X: drop the room / spell / trap...
         }
         s_work_state = PlayerWorkState();
         s_plain_hand = PlainHand();

@@ -549,7 +549,8 @@ void add_thing(ThingSnapshot& snap, struct Thing* thing, int hand_slot)
 int FindSlapTarget(float x, float y, float radius)
 {
     struct PlayerInfo* player = get_my_player();
-    if (player == nullptr || !power_hand_is_empty(player) || player->work_state != PSt_CtrlDungeon)
+    // Any tool: a swat is unmistakable, so it slaps even with a room or spell chosen.
+    if (player == nullptr || !power_hand_is_empty(player))
         return 0;
     const int r = (int)(radius / COORD_PER_STL) + 1;
     const int cx = (int)(x / COORD_PER_STL), cy = (int)(y / COORD_PER_STL);

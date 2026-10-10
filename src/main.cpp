@@ -144,6 +144,7 @@
 #include <cstdint>
 #include "timer.h"
 #include "kfx/vr/VR.h"
+#include <direct.h>
 
 #ifdef FUNCTESTING
   #include "ftests/ftest.h"
@@ -1667,6 +1668,23 @@ static short process_command_line(unsigned short argc, char *argv[])
   // Note: the working log file is set up in LbBullfrogMain
 
   set_default_startup_parameters();
+
+  // The VR build (keeperfx_vr.exe, kept in a "vr" subfolder of the install):
+  // started directly, e.g. by double-clicking it, it turns VR on itself and
+  // runs from the KeeperFX folder above it, as its launchers do.
+  {
+    const char* exe_name = strrchr(fullpath, '\\');
+    if (exe_name == NULL) exe_name = strrchr(fullpath, '/');
+    exe_name = (exe_name != NULL) ? exe_name + 1 : fullpath;
+    if (strncasecmp(exe_name, "keeperfx_vr", 11) == 0)
+    {
+      vr_requested = 1;
+      start_params.overrides[Clo_Renderer] = true;
+      start_params.renderer_type = RENDERER_OPENGL;
+      if (!LbFileExists("keeperfx.cfg") && LbFileExists("../keeperfx.cfg"))
+          _chdir("..");
+    }
+  }
 
   short bad_param;
   LevelNumber level_num;
