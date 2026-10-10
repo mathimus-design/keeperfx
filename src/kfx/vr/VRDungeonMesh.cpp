@@ -16,6 +16,7 @@
 #include "slab_data.h"       // get_slab_number()
 #include "engine_arrays.h"   // floor_height_table[], lintel_top_height[]
 #include "engine_textures.h" // TEXTURE_BLOCKS_COUNT
+#include "frontend.h"        // frontend_menu_state
 #include "player_data.h"     // my_player_number, get_my_player(), PVT_*
 #include "local_camera.h"    // get_local_active_camera(), get_local_view_type()
 #include "engine_camera.h"   // struct Camera
@@ -280,8 +281,11 @@ void UpdateDungeonSnapshot(DungeonSnapshot& snap)
 {
     struct PlayerInfo* player = get_my_player();
     struct Camera* cam = (player != nullptr) ? get_local_active_camera(player) : nullptr;
+    // After a level the game is back in its menus (level stats...), drawn with
+    // the menu palette, while the player's view still says dungeon.
     snap.in_level = (cam != nullptr) && (get_local_view_type(player) != PVT_None)
-                 && (game.map_subtiles_x > 0) && (game.map_subtiles_y > 0);
+                 && (game.map_subtiles_x > 0) && (game.map_subtiles_y > 0)
+                 && (frontend_menu_state == FeSt_INITIAL);
     if (!snap.in_level)
         return;
 
