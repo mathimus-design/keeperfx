@@ -1686,7 +1686,6 @@ Mat4 info_model()
 
 constexpr float k_info_button = 0.028f;  // hide / show button size, metres
 
-void draw_press_outline(const Mat4& view_proj, Vec3 at, Vec3 right, Vec3 up, Vec3 normal, bool flashing, float hover_size);
 
 /** Places the message box and the hide button, and handles touches on both.
  *  Returns the touch to pass on to the game (the box's own buttons). */
@@ -2091,18 +2090,8 @@ void draw_info_box(const Mat4& view_proj)
     }
     glBindTexture(GL_TEXTURE_2D, 0);
     glUseProgram(s.solid_prog);
-    if (s.info_btn_hover >= 0)
-    {
-        const int i = s.info_btn_hover;
-        const bool flashing = s.info_flash_time > 0.0f && s.info_btn_flash == i;
-        draw_press_outline(view_proj, s.info_btn_center[i], s.info_right, s.info_up, s.info_normal, flashing,
-                           std::fmax(s.info_btn_world_w[i], s.info_btn_world_h[i]) * 1.1f);
-    }
-    else if (s_info_in.valid)
-    {
-        draw_press_outline(view_proj, s.info_pointer, s.info_right, s.info_up, s.info_normal,
-                           s.info_flash_time > 0.0f, 0.018f);
-    }
+    // No outline on it: the copied buttons light up themselves, as the game
+    // draws them under its cursor.
 }
 
 /******************************************************************************/
@@ -2986,37 +2975,6 @@ void draw_selection(const Mat4& mvp)
     glBindVertexArray(0);
 }
 
-/** A square outline around a pointer on a flat screen (menu screen, wrist
- *  panel): gold while hovering, green and larger for a moment once a press
- *  lands, as the palm icons do. Uses the solid program and cube, bound. */
-void draw_press_outline(const Mat4& view_proj, Vec3 at, Vec3 right, Vec3 up, Vec3 normal, bool flashing, float hover_size)
-{
-    const float size = flashing ? hover_size * 1.55f : hover_size;
-    const float bar = 0.003f;
-    const Vec3 c = at + normal * 0.002f;
-    if (flashing)
-        glUniform4f(s.loc_solid_color, 0.45f, 1.0f, 0.45f, 1.0f);
-    else
-        glUniform4f(s.loc_solid_color, 1.0f, 0.82f, 0.25f, 1.0f);
-    for (int side = 0; side < 4; side++)
-    {
-        const bool horizontal = (side < 2);
-        const float offset = (side % 2 == 0 ? 0.5f : -0.5f) * size;
-        const Vec3 centre = horizontal ? c + up * offset : c + right * offset;
-        const Vec3 r = right * (horizontal ? size + bar : bar);
-        const Vec3 u = up * (horizontal ? bar : size + bar);
-        const Vec3 d = normal * 0.001f;
-        Mat4 m = Mat4::Identity();
-        m.m[0] = r.x; m.m[1] = r.y; m.m[2] = r.z;
-        m.m[4] = u.x; m.m[5] = u.y; m.m[6] = u.z;
-        m.m[8] = d.x; m.m[9] = d.y; m.m[10] = d.z;
-        m.m[12] = centre.x; m.m[13] = centre.y; m.m[14] = centre.z;
-        const Mat4 mvp = view_proj * m;
-        glUniformMatrix4fv(s.loc_solid_mvp, 1, GL_FALSE, mvp.m);
-        glDrawArrays(GL_TRIANGLES, 0, 36);
-    }
-}
-
 void draw_lit_box(const Mat4& view_proj, const Mat4& model, float r, float g, float b)
 {
     const Mat4 mvp = view_proj * model;
@@ -3309,10 +3267,10 @@ void draw_eye(const EyeTarget& eye, const Mat4& view_proj, const GLWorldViewRend
         glDrawArrays(GL_TRIANGLES, 0, 36);
         glBindTexture(GL_TEXTURE_2D, 0);
         glUseProgram(s.solid_prog);
+        // The game's own buttons and cursor show where the finger is; only
+        // the ray is drawn.
         if (s.menu_pointer_valid)
         {
-            draw_press_outline(view_proj, s.menu_pointer, s.menu_right, s.menu_up, s.menu_normal,
-                               s.menu_flash_time > 0.0f, 0.032f);
             if (s.menu_by_ray)
             {
                 const Hand& h = s.hands[1];
@@ -3341,16 +3299,11 @@ void draw_eye(const EyeTarget& eye, const Mat4& view_proj, const GLWorldViewRend
     draw_info_box(view_proj);
     draw_cancel_button(view_proj);
 
-    // The fingertip on the wrist panel: an outline instead of the laser.
-    if (s_pointer_in.valid && s.panel_finger)
-    {
-        draw_press_outline(view_proj, s.panel_pointer, s.panel_right, s.panel_up, s.panel_normal,
-                           s.panel_flash_time > 0.0f, 0.018f);
-    }
     // Pointing ray (right hand, or the left one casting a spell), ending in a
     // marker where it meets the dungeon or the panel. Brighter while the
-    // trigger is held.
-    else if (s_pointer_in.valid && s.ray_valid && (s_pointer_in.panel_hit || s_pointer_out.hit))
+    // trigger is held. None while the fingertip is on the wrist panel: the
+    // panel's own button highlight shows the touch.
+    if (s_pointer_in.valid && !s.panel_finger && s.ray_valid && (s_pointer_in.panel_hit || s_pointer_out.hit))
     {
         // Only drawn when it lands on something (the table or the panel).
         float length = 2.0f;
