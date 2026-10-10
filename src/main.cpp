@@ -1361,6 +1361,11 @@ void update_local_mouse_light(void)
     // ... or during text input (save menu)
     if (game_is_busy_doing_gui_string_input())
         return;
+    // ... or in VR: the mouse is parked mid-screen there, while the hand light
+    // follows the VR pointer through the packets (update_mouse_light()); both
+    // moving it made it flicker between the two spots.
+    if (VR_IsHeadsetActive())
+        return;
 
     struct Camera *cam = get_local_active_camera(player);
     struct Coord3d pos;
