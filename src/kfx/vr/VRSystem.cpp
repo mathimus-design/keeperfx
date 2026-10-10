@@ -3762,10 +3762,27 @@ void GameThreadSync()
         FollowDefaultAudioDevice();
     }
 
+    // In the game's own menus the pause button is Back, as Escape: from the
+    // level map to the main menu, whose Quit button leaves the game. Held for
+    // one frame; the menus take (and clear) it when they read their input.
+    static bool escape_held = false;
+    if (escape_held)
+    {
+        SetEscapeKey(false);
+        escape_held = false;
+    }
     if (s_pause_request)
     {
         s_pause_request = false;
-        s_pause_pending = true;  // taken by the input code via VR_ConsumePauseRequest()
+        if (InFrontendMenus())
+        {
+            SetEscapeKey(true);
+            escape_held = true;
+        }
+        else
+        {
+            s_pause_pending = true;  // taken by the input code via VR_ConsumePauseRequest()
+        }
     }
     if (s_enter_request)
     {

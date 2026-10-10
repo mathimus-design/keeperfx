@@ -75,6 +75,10 @@ bool PlainHand();
 
 /** Game thread: true once the level is won or lost (waiting to continue). */
 bool LevelDecided();
+/** The game is in its own menus (main menu, level map, level stats...), not a level. */
+bool InFrontendMenus();
+/** Holds Escape down (or lets it go) for the frontend's back handling. */
+void SetEscapeKey(bool down);
 
 /** Game thread: true while the game shows a menu rather than the dungeon:
  *  the frontend (main menu, campaign map, ...), a menu window in a level, or

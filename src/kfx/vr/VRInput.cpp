@@ -22,6 +22,7 @@
 #include "game_legacy.h"     // game.operation_flags, GOF_ShowGui
 #include "config_players.h"  // get_player_state_stats(), PsPg_Spell, PSt_*
 #include "packets.h"         // set_players_packet_action(), PckA_SetPlyrState
+#include "bflib_keybrd.h"    // lbKeyOn[], KC_ESCAPE
 #include "post_inc.h"
 
 namespace VR {
@@ -198,6 +199,16 @@ bool PlainHand()
 {
     struct PlayerInfo* player = get_my_player();
     return player != nullptr && player->work_state == PSt_CtrlDungeon;
+}
+
+bool InFrontendMenus()
+{
+    return frontend_menu_state != FeSt_INITIAL;
+}
+
+void SetEscapeKey(bool down)
+{
+    lbKeyOn[KC_ESCAPE] = down ? 1 : 0;
 }
 
 bool LevelDecided()
