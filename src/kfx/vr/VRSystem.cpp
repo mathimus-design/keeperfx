@@ -465,7 +465,6 @@ struct State {
     Vec3 fp_eye = {0, 0, 0};                    // game units
     Vec3 last_head = {0, 0, 0};                 // head position of the last rendered frame
     int window_w = 0, window_h = 0;             // desktop window, for the spectator mirror
-    bool finish_was_down = false;               // A / trigger last frame, to continue after a level
     float decided_time = 0;                     // seconds since the level was won or lost
     float frame_dt = 0;                         // seconds, this frame
     // Pickaxe swing detection (possessing a digger).
@@ -540,6 +539,14 @@ struct State {
     bool info_ready = false;                // copied this frame
     bool info_shown = false;                // drawn this frame
     bool info_hidden = false;               // hidden with the button on the panel
+    // "Next" button, shown once the level is won or lost.
+    bool continue_shown = false;
+    bool continue_was_shown = false;
+    bool continue_hover = false;
+    bool continue_armed = true;
+    float continue_flash = 0;
+    Vec3 continue_center = {0, 0, 0};
+    Vec3 continue_right = {1, 0, 0}, continue_up = {0, 1, 0}, continue_normal = {0, 0, 1};
     // "Back to the hand" button, shown while a room / spell / trap... is chosen.
     bool cancel_shown = false;
     bool cancel_hover = false;
@@ -2067,6 +2074,104 @@ void draw_cancel_button(const Mat4& view_proj)
     plate(d2 * (size * 0.8f), d1 * (size * 0.16f), 0.003f);
 }
 
+constexpr float k_continue_button = 0.05f;  // metres
+
+/** The "next" button: a green arrow at the top of the wrist panel, or beside
+ *  the left hand while the panel is folded away, once the level is won or
+ *  lost. Tapping it moves on, as the space bar does; until then the player
+ *  can keep looking around. Not while possessing (leave the creature first). */
+void update_continue_button(Vec3 head, const Hand& hand)
+{
+    s.continue_shown = s.in_level && s_level_decided && !s.possessing && !s.menu_shown && s.hands[0].tracked
+                    && s.decided_time > 1.0f;
+    if (s.continue_shown && !s.continue_was_shown)
+        buzz(0, 0.5f, 0.12f);  // a nudge to look at the left hand
+    s.continue_was_shown = s.continue_shown;
+    if (s.continue_flash > 0.0f)
+        s.continue_flash -= s.frame_dt;
+    if (!s.continue_shown)
+    {
+        s.continue_hover = false;
+        s.continue_armed = true;
+        return;
+    }
+    if (s.panel_shown)
+    {
+        s.continue_right = s.panel_right;
+        s.continue_up = s.panel_up;
+        s.continue_normal = s.panel_normal;
+        s.continue_center = s.panel_center + s.panel_up * (s.panel_world_h * 0.5f + k_continue_button * 0.75f);
+    }
+    else
+    {
+        const Vec3 base = s.hands[0].pos + Vec3{0.0f, 0.07f, 0.0f};
+        Vec3 n = head - base;
+        n = n * (1.0f / std::fmax(Length(n), 1e-4f));
+        Vec3 right = { n.z, 0.0f, -n.x };
+        right = right * (1.0f / std::fmax(Length(right), 1e-4f));
+        s.continue_right = right;
+        s.continue_up = { n.y * right.z - n.z * right.y, n.z * right.x - n.x * right.z, n.x * right.y - n.y * right.x };
+        s.continue_normal = n;
+        // Right of the message box, which sits above the hand.
+        const float aside = s.info_shown ? s.info_world_w * 0.5f + k_continue_button : 0.0f;
+        s.continue_center = base + right * aside;
+    }
+    s.continue_hover = false;
+    if (!hand.tracked)
+        return;
+    const Vec3 d = index_fingertip(hand) - s.continue_center;
+    const float du = d.x * s.continue_right.x + d.y * s.continue_right.y + d.z * s.continue_right.z;
+    const float dv = d.x * s.continue_up.x + d.y * s.continue_up.y + d.z * s.continue_up.z;
+    const float depth = d.x * s.continue_normal.x + d.y * s.continue_normal.y + d.z * s.continue_normal.z;
+    const bool over = std::fabs(du) < k_continue_button * 0.75f && std::fabs(dv) < k_continue_button * 0.75f && depth > -0.05f;
+    s.continue_hover = over && depth < 0.06f;
+    if (over && depth < 0.012f && s.continue_armed)
+    {
+        s_finish_request = true;
+        s.continue_armed = false;
+        s.continue_flash = 0.35f;
+        buzz(1, 0.7f, 0.06f);
+    }
+    else if (!over || depth > 0.03f)
+    {
+        s.continue_armed = true;
+    }
+}
+
+/** Draws the "next" button. Solid program and cube bound. */
+void draw_continue_button(const Mat4& view_proj)
+{
+    if (!s.continue_shown)
+        return;
+    const float pulse = 0.5f + 0.5f * std::sin((float)s.frames_rendered * 0.1f);
+    const float grow = (s.continue_flash > 0.0f) ? 1.25f : s.continue_hover ? 1.12f : 1.0f + 0.05f * pulse;
+    const float size = k_continue_button * grow;
+    auto plate = [&](Vec3 at, Vec3 r, Vec3 u, float lift) {
+        Mat4 m = Mat4::Identity();
+        const Vec3 dz = s.continue_normal * 0.003f;
+        const Vec3 c = at + s.continue_normal * lift;
+        m.m[0] = r.x; m.m[1] = r.y; m.m[2] = r.z;
+        m.m[4] = u.x; m.m[5] = u.y; m.m[6] = u.z;
+        m.m[8] = dz.x; m.m[9] = dz.y; m.m[10] = dz.z;
+        m.m[12] = c.x; m.m[13] = c.y; m.m[14] = c.z;
+        const Mat4 mvp = view_proj * m;
+        glUniformMatrix4fv(s.loc_solid_mvp, 1, GL_FALSE, mvp.m);
+        glDrawArrays(GL_TRIANGLES, 0, 36);
+    };
+    if (s.continue_flash > 0.0f)
+        glUniform4f(s.loc_solid_color, 0.6f, 1.0f, 0.6f, 1.0f);
+    else
+        glUniform4f(s.loc_solid_color, 0.15f, 0.55f + 0.15f * pulse, 0.20f, 1.0f);
+    plate(s.continue_center, s.continue_right * size, s.continue_up * size, 0.0f);
+    // A white arrow pointing right: two bars meeting at its tip.
+    const float k = 0.70710678f;
+    const Vec3 d1 = (s.continue_right - s.continue_up) * k, d2 = (s.continue_right + s.continue_up) * k;
+    const Vec3 tip_side = s.continue_right * (size * 0.12f);
+    glUniform4f(s.loc_solid_color, 0.95f, 0.95f, 0.88f, 1.0f);
+    plate(s.continue_center + tip_side + s.continue_up * (size * 0.15f), d1 * (size * 0.5f), d2 * (size * 0.14f), 0.003f);
+    plate(s.continue_center + tip_side - s.continue_up * (size * 0.15f), d2 * (size * 0.5f), d1 * (size * 0.14f), 0.003f);
+}
+
 /** New text: raise the alert when a message box opens or shows a different
  *  message, buzz the left controller every couple of seconds (a few times),
  *  and drop it once the text is looked at. */
@@ -3436,6 +3541,7 @@ void draw_eye(const EyeTarget& eye, const Mat4& view_proj, const GLWorldViewRend
     }
     draw_info_box(view_proj);
     draw_cancel_button(view_proj);
+    draw_continue_button(view_proj);
 
     // Pointing ray (right hand, or the left one casting a spell), ending in a
     // marker where it meets the dungeon or the panel. Brighter while the
@@ -3542,21 +3648,14 @@ bool render_views(GLWorldViewRenderer& world, XrTime time,
     else if (!s.menu_placed)
         place_menu(head, head_gaze);
     s_menu_in = update_menu_touch(s.hands[1]);
-    // Won or lost: A or the trigger continues, like the space bar. Not inside a
-    // creature, and only after a moment, so the blow that won the level (or a
-    // held trigger) does not skip straight past the result.
+    // Won or lost: the game waits (as for the space bar) until the green
+    // "next" button by the left hand is tapped, so the player can look around
+    // first; see update_continue_button().
     {
         if (s_level_decided)
             s.decided_time += s.frame_dt;
         else
             s.decided_time = 0.0f;
-        const bool down = s.hands[1].action || s.hands[1].trigger > 0.6f;
-        if (s_level_decided && !s.possessing && s.decided_time > 1.5f && down && !s.finish_was_down)
-        {
-            s_finish_request = true;
-            buzz(1, 0.7f, 0.06f);
-        }
-        s.finish_was_down = down;
         // A on a menu screen: Enter, to confirm a high score name (the game
         // fills in a default name; there is no keyboard in VR).
         if (s.menu_shown && !s.in_level && s.hands[1].action && !s.enter_was_down)
@@ -3780,6 +3879,9 @@ bool render_views(GLWorldViewRenderer& world, XrTime time,
     // of the dungeon pointer (see GameThreadSync()).
     s_info_in = update_info_box(head, pointer);
     update_cancel_button(head, pointer);
+    update_continue_button(head, pointer);
+    if (s.continue_hover)
+        s.ray_valid = false;
     if (s.cancel_hover)
         s.ray_valid = false;
     if (s_info_in.valid)
@@ -4177,6 +4279,11 @@ int VR_ConsumePauseRequest(void)
     return 1;
 }
 
+int VR_PauseRequestPending(void)
+{
+    return (vr_requested && VR::s_pause_pending) ? 1 : 0;
+}
+
 int VR_GetPossessionControls(int* yaw, int* pitch, int* move_x, int* move_y)
 {
     if (!vr_requested || !VR::s_look_game.valid)
@@ -4206,6 +4313,7 @@ void RenderThreadShutdown() {}
 int VR_GetSoundListener(int*, int*, int*, int*) { return 0; }
 int VR_IsHeadsetActive(void) { return 0; }
 int VR_ConsumePauseRequest(void) { return 0; }
+int VR_PauseRequestPending(void) { return 0; }
 int VR_ConsumeSlapTarget(void) { return 0; }
 int VR_ConsumeFinishRequest(void) { return 0; }
 int VR_ConsumeEnterRequest(void) { return 0; }

@@ -220,9 +220,9 @@ bool LevelDecided()
 bool MenuScreenWanted(bool in_level)
 {
     // Paused too: the screen shows the game's pause display, and its menus
-    // (options, quit) can be reached from it. And once the level is won or
-    // lost, to show the game's "press to continue" message.
-    return !in_level || a_menu_window_is_active() || (game.operation_flags & GOF_Paused) != 0 || LevelDecided();
+    // (options, quit) can be reached from it. Not for a won or lost level: the
+    // table stays, to look around, until the green "next" button is tapped.
+    return !in_level || a_menu_window_is_active() || (game.operation_flags & GOF_Paused) != 0;
 }
 
 void ApplyMenuTouch(const MenuInput& in)

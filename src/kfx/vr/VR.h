@@ -40,6 +40,10 @@ int VR_GetPossessionControls(int* yaw, int* pitch, int* move_x, int* move_y);
  *  pressed; the input code then toggles pause as for the pause key. */
 int VR_ConsumePauseRequest(void);
 
+/** Game thread: non-zero while a VR pause press waits for the input code
+ *  (without taking it), so the input code reads it even when a menu has the pointer. */
+int VR_PauseRequestPending(void);
+
 /** Game thread: once a swat of the Keeper's hand has picked a creature, its
  *  thing index (once), for the input code to slap like a right-click. */
 int VR_ConsumeSlapTarget(void);

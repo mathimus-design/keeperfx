@@ -3180,7 +3180,12 @@ static short get_inputs(void)
         }
     }
     TbBool inp_handled = false;
-    if (!flag_is_set(game.operation_flags,GOF_Paused) || active_menu_functions_while_paused() || flag_is_set(game.operation_flags,GOF_WorldInfluence))
+    // A VR pause press goes straight to the pause handling: with a menu under
+    // the VR pointer the GUI would take the input every frame, and the game
+    // could not be resumed.
+    if (VR_PauseRequestPending())
+        inp_handled = get_global_inputs();
+    if (!inp_handled && (!flag_is_set(game.operation_flags,GOF_Paused) || active_menu_functions_while_paused() || flag_is_set(game.operation_flags,GOF_WorldInfluence)))
         inp_handled = get_gui_inputs(1);
     if (!inp_handled)
         inp_handled = get_global_inputs();

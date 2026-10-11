@@ -652,18 +652,24 @@ void GetPossessionView(PossessionView* out)
     const unsigned char view = get_local_view_type(player);
     if (view != PVT_CreatureContrl && view != PVT_CreaturePasngr)
         return;
+    // Usually a creature; Possess also works on your chickens (an original DK
+    // trick), which are objects.
     struct Thing* creature = thing_get(player->controlled_thing_idx);
-    if (!thing_exists(creature) || !thing_is_creature(creature))
+    if (!thing_exists(creature))
+        return;
+    const bool is_creature = thing_is_creature(creature);
+    if (!is_creature && creature->class_id != TCls_Object)
         return;
     const struct ThingInterpolateResult interp = interpolate_thing(creature);
     out->active = true;
     out->controlling = (view == PVT_CreatureContrl);
     out->eye_x = (float)interp.mappos.x.val;
     out->eye_y = (float)interp.mappos.y.val;
-    out->eye_z = (float)(interp.mappos.z.val + get_creature_eye_height(creature));
+    constexpr int k_chicken_eye_height = 80;  // a chicken's-eye view
+    out->eye_z = (float)(interp.mappos.z.val + (is_creature ? get_creature_eye_height(creature) : k_chicken_eye_height));
     out->yaw = creature->move_angle_xy & ANGLE_MASK;
     out->thing_idx = creature->index;
-    out->digger = thing_is_creature_digger(creature);
+    out->digger = is_creature && thing_is_creature_digger(creature);
 }
 
 void UpdateThingSnapshot(ThingSnapshot& snap)
