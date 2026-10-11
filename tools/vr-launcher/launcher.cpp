@@ -1,11 +1,12 @@
 // KeeperFX VR launcher: a small window next to the "vr" folder of a KeeperFX
 // install. It checks the install, finds the VR runtimes (Virtual Desktop,
 // SteamVR, Meta Quest Link), and starts vr\keeperfx_vr.exe with the chosen one.
+// It also asks GitHub whether a newer test build is out, and offers its page.
 //
 // Build (MinGW 32-bit; static, so it needs no other files next to it):
 //   windres launcher.rc -O coff -o launcher_res.o
 //   g++ -std=c++17 -O2 -s -static -municode -mwindows launcher.cpp launcher_res.o
-//       -lcomctl32 -lshell32 -ladvapi32 -o "KeeperFX VR.exe"
+//       -lcomctl32 -lshell32 -ladvapi32 -lwinhttp -o "KeeperFX VR.exe"
 
 #ifndef UNICODE
 #define UNICODE
@@ -16,13 +17,21 @@
 #include <windows.h>
 #include <commctrl.h>
 #include <shellapi.h>
+#include <winhttp.h>
 #include <string>
 #include <vector>
+#include <algorithm>
 
 namespace {
 
 const wchar_t* const k_title = L"KeeperFX VR";
 const wchar_t* const k_issues_url = L"https://github.com/mathimus-design/keeperfx/issues/new";
+// Test builds are GitHub releases tagged vr-test-<number> (all pre-releases,
+// so the API's "latest" would skip them: list the recent ones instead).
+const wchar_t* const k_api_host = L"api.github.com";
+const wchar_t* const k_releases_path = L"/repos/mathimus-design/keeperfx/releases?per_page=30";
+const wchar_t* const k_release_page = L"https://github.com/mathimus-design/keeperfx/releases/tag/vr-test-";
+const UINT WM_APP_UPDATE = WM_APP + 1;  // wParam: newest test build number found
 
 enum RuntimeKind { RK_Auto, RK_VirtualDesktop, RK_SteamVR, RK_Meta, RK_Other };
 
@@ -40,6 +49,7 @@ enum ControlId {
     ID_LOG,
     ID_README,
     ID_REPORT,
+    ID_UPDATE,
 };
 
 struct Check {
@@ -55,7 +65,8 @@ std::vector<Runtime> g_runtimes;
 std::vector<Check> g_checks;
 bool g_can_play = false;
 HFONT g_font = nullptr, g_bold = nullptr, g_big = nullptr;
-HWND g_runtime_box = nullptr, g_skip_intro = nullptr, g_record = nullptr, g_status = nullptr;
+HWND g_runtime_box = nullptr, g_skip_intro = nullptr, g_record = nullptr, g_status = nullptr, g_update = nullptr;
+int g_newest_build = 0;
 int g_dpi = 96;
 
 int S(int v) { return MulDiv(v, g_dpi, 96); }
@@ -396,14 +407,89 @@ HWND make(HWND parent, const wchar_t* cls, const wchar_t* text, DWORD style, int
     return c;
 }
 
+/** This build's number, from the "Build: vr-test-<n>" line of vr\version.txt (0 if none). */
+int local_build_number()
+{
+    const size_t at = g_version.find(L"Build: vr-test-");
+    return (at == std::wstring::npos) ? 0 : _wtoi(g_version.c_str() + at + 15);
+}
+
+/** GET https://api.github.com<path>; empty on any failure (offline, timeout...). */
+std::string https_get(const wchar_t* host, const wchar_t* path)
+{
+    std::string body;
+    HINTERNET session = WinHttpOpen(L"KeeperFX-VR-Launcher", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (session == nullptr)
+        session = WinHttpOpen(L"KeeperFX-VR-Launcher", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (session == nullptr)
+        return body;
+    WinHttpSetTimeouts(session, 5000, 5000, 5000, 5000);
+    HINTERNET conn = WinHttpConnect(session, host, INTERNET_DEFAULT_HTTPS_PORT, 0);
+    HINTERNET req = conn ? WinHttpOpenRequest(conn, L"GET", path, nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE) : nullptr;
+    if (req && WinHttpSendRequest(req, L"Accept: application/vnd.github+json\r\n", (DWORD)-1L, WINHTTP_NO_REQUEST_DATA, 0, 0, 0)
+            && WinHttpReceiveResponse(req, nullptr))
+    {
+        DWORD status = 0, size = sizeof(status);
+        WinHttpQueryHeaders(req, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &status, &size, WINHTTP_NO_HEADER_INDEX);
+        if (status == 200)
+        {
+            DWORD avail = 0;
+            while (WinHttpQueryDataAvailable(req, &avail) && avail > 0 && body.size() < 4 * 1024 * 1024)
+            {
+                std::string chunk(avail, '\0');
+                DWORD got = 0;
+                if (!WinHttpReadData(req, &chunk[0], avail, &got) || got == 0)
+                    break;
+                body.append(chunk.data(), got);
+            }
+        }
+    }
+    if (req) WinHttpCloseHandle(req);
+    if (conn) WinHttpCloseHandle(conn);
+    WinHttpCloseHandle(session);
+    return body;
+}
+
+/** The highest vr-test-<n> among the release tags in a GitHub releases listing. */
+int newest_build_in(const std::string& json)
+{
+    int newest = 0;
+    size_t at = 0;
+    while ((at = json.find("\"tag_name\"", at)) != std::string::npos)
+    {
+        at += 10;
+        size_t q = json.find('"', json.find(':', at));
+        if (q == std::string::npos)
+            break;
+        const std::string prefix = "vr-test-";
+        if (json.compare(q + 1, prefix.size(), prefix) == 0)
+            newest = std::max(newest, atoi(json.c_str() + q + 1 + prefix.size()));
+        at = q + 1;
+    }
+    return newest;
+}
+
+/** Background check for a newer test build; tells the window when done. */
+DWORD WINAPI update_check_thread(LPVOID param)
+{
+    const int newest = newest_build_in(https_get(k_api_host, k_releases_path));
+    PostMessageW((HWND)param, WM_APP_UPDATE, (WPARAM)newest, 0);
+    return 0;
+}
+
 void build_ui(HWND wnd)
 {
     int y = 14;
     make(wnd, L"STATIC", L"KeeperFX VR", SS_LEFT, 16, y, 300, 30, 0, g_big);
     std::wstring ver = g_version;
     const size_t nl = ver.find(L"Commit:");
-    ver = (nl != std::wstring::npos) ? L"Test build, " + ver.substr(nl) : L"Test build";
-    for (wchar_t& c : ver) if (c == L'\r' || c == L'\n') c = L' ';
+    std::wstring commit = (nl != std::wstring::npos) ? ver.substr(nl) : L"";
+    const size_t eol = commit.find_first_of(L"\r\n");
+    if (eol != std::wstring::npos)
+        commit = commit.substr(0, eol);
+    const int build = local_build_number();
+    ver = (build > 0 ? L"Test build " + std::to_wstring(build) : std::wstring(L"Test build"))
+        + (commit.empty() ? L"" : L", " + commit);
     make(wnd, L"STATIC", ver.c_str(), SS_LEFT, 18, y + 32, 420, 18, 0, nullptr);
     y += 60;
 
@@ -446,6 +532,9 @@ void build_ui(HWND wnd)
     make(wnd, L"BUTTON", L"Report a problem", BS_PUSHBUTTON | WS_TABSTOP, 308, y, 140, 28, ID_REPORT, nullptr);
     y += 38;
     g_status = make(wnd, L"STATIC", L"Connect your headset (and start SteamVR if you use it), then press Play.", SS_LEFT, 14, y, 436, 18, 0, nullptr);
+    // Shown once the update check finds a newer build.
+    g_update = make(wnd, L"BUTTON", L"Download", BS_PUSHBUTTON | WS_TABSTOP, 348, y - 5, 100, 26, ID_UPDATE, nullptr);
+    ShowWindow(g_update, SW_HIDE);
     y += 26;
 
     RECT r = {0, 0, S(460), S(y)};
@@ -459,6 +548,23 @@ LRESULT CALLBACK wnd_proc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
     {
     case WM_CREATE:
         build_ui(wnd);
+        if (local_build_number() > 0)
+        {
+            HANDLE th = CreateThread(nullptr, 0, update_check_thread, wnd, 0, nullptr);
+            if (th) CloseHandle(th);
+        }
+        return 0;
+    case WM_APP_UPDATE:
+        g_newest_build = (int)wp;
+        if (g_newest_build > local_build_number() && local_build_number() > 0)
+        {
+            RECT r;
+            GetWindowRect(g_status, &r);
+            SetWindowPos(g_status, nullptr, 0, 0, S(326), r.bottom - r.top, SWP_NOMOVE | SWP_NOZORDER);
+            set_status(L"Test build " + std::to_wstring(g_newest_build) + L" is out (you have "
+                       + std::to_wstring(local_build_number()) + L").");
+            ShowWindow(g_update, SW_SHOW);
+        }
         return 0;
     case WM_CTLCOLORSTATIC:
     {
@@ -482,6 +588,9 @@ LRESULT CALLBACK wnd_proc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
         case ID_LOG:    open_path(wnd, log_path()); return 0;
         case ID_README: open_path(wnd, g_root + L"\\README-VR.txt"); return 0;
         case ID_REPORT: report_problem(wnd); return 0;
+        case ID_UPDATE:
+            ShellExecuteW(wnd, L"open", (std::wstring(k_release_page) + std::to_wstring(g_newest_build)).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+            return 0;
         case ID_RUNTIME:
         case ID_SKIP_INTRO:
         case ID_RECORD:
