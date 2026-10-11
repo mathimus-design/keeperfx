@@ -35,6 +35,7 @@ int vr_requested = 0;
 #include "kfx/vr/VRDungeonMesh.h"
 #include "kfx/vr/VRThings.h"
 #include "kfx/vr/VRInput.h"
+#include "kfx/vr/VRHandMesh.h"
 #include "kfx/renderer/opengl/GLFunctions.h"
 #include "kfx/renderer/opengl/GLWorldViewRenderer.h"
 #include "kfx/renderer/opengl/GLShaders.h"   // WORLD_FRAGMENT_SHADER
@@ -498,6 +499,8 @@ struct State {
     GLuint lit_prog = 0;
     GLint loc_lit_mvp = -1, loc_lit_model = -1, loc_lit_color = -1, loc_lit_light = -1;
     GLuint lit_cube_vao = 0, lit_cube_vbo = 0;   // unit cube with face normals
+    GLuint hand_vao = 0, hand_vbo = 0;           // the Keeper's hand parts (VRHandMesh)
+    HandMesh hand_mesh;
     GLuint sprite_prog = 0;
     GLint loc_sprite_mvp = -1, loc_sprite_stride = -1, loc_sprite_min_shade = -1;
     GLint loc_sprite_use_fade = -1, loc_sprite_alpha = -1, loc_sprite_shadow = -1, loc_sprite_one_colour = -1;
@@ -831,6 +834,22 @@ bool create_gl_resources()
         glBindVertexArray(s.lit_cube_vao);
         glBindBuffer(GL_ARRAY_BUFFER, s.lit_cube_vbo);
         glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(cube.size() * sizeof(float)), cube.data(), GL_STATIC_DRAW);
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)0);
+        glEnableVertexAttribArray(1);
+        glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)(3 * sizeof(float)));
+        glBindVertexArray(0);
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+    }
+    if (s.hand_vao == 0)
+    {
+        std::vector<float> verts;
+        BuildHandMesh(verts, s.hand_mesh);
+        glGenVertexArrays(1, &s.hand_vao);
+        glGenBuffers(1, &s.hand_vbo);
+        glBindVertexArray(s.hand_vao);
+        glBindBuffer(GL_ARRAY_BUFFER, s.hand_vbo);
+        glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(verts.size() * sizeof(float)), verts.data(), GL_STATIC_DRAW);
         glEnableVertexAttribArray(0);
         glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)0);
         glEnableVertexAttribArray(1);
@@ -1304,6 +1323,9 @@ void destroy_gl()
     if (s.panel_prog) glDeleteProgram(s.panel_prog);
     if (s.lit_cube_vbo) glDeleteBuffers(1, &s.lit_cube_vbo);
     if (s.lit_cube_vao) glDeleteVertexArrays(1, &s.lit_cube_vao);
+    if (s.hand_vbo) glDeleteBuffers(1, &s.hand_vbo);
+    if (s.hand_vao) glDeleteVertexArrays(1, &s.hand_vao);
+    s.hand_vbo = s.hand_vao = 0;
     if (s.lit_prog) glDeleteProgram(s.lit_prog);
     s.lit_cube_vbo = s.lit_cube_vao = s.lit_prog = 0;
     s.panel_fbo = s.panel_tex = s.panel_prog = 0;
@@ -1500,16 +1522,39 @@ bool menu_coords(Vec3 p, float* u, float* v, float* depth)
     return *u >= 0.0f && *u <= 1.0f && *v >= 0.0f && *v <= 1.0f;
 }
 
+// The Keeper's hand: its shape, shared by draw_keeper_hand() and
+// index_fingertip() so touches land where the drawn finger is. In the palm's
+// frame the fingers point to -Z, the back of the hand is +X (a right palm
+// faces -X), and the index / thumb side is +Y.
+constexpr float k_finger_y[4] = { 0.027f, 0.009f, -0.009f, -0.026f };  // index .. little finger
+constexpr float k_finger_len[4] = { 0.95f, 1.0f, 0.93f, 0.76f };
+constexpr float k_finger_thick[4] = { 1.0f, 1.05f, 1.0f, 0.86f };
+constexpr float k_segment_len[3] = { 0.044f, 0.032f, 0.025f };         // long, bony fingers
+constexpr float k_segment_radius[3] = { 0.0074f, 0.0065f, 0.0057f };
+constexpr float k_joint_bend[3] = { 1.25f, 1.45f, 1.0f };              // radians at a full curl
+constexpr float k_rest_curl = 0.08f;                                     // a relaxed, nearly straight hand
+constexpr float k_finger_splay = 2.0f;                                   // radians per metre from the middle
+
+/** The palm's frame: the back of the hand just outside the controller handle,
+ *  turned like the aim pose (the laser). */
+Mat4 hand_palm_frame(const Hand& hand)
+{
+    return Mat4::FromPose(hand.aim_tracked ? hand.aim_rot : hand.rot, hand.pos) * Mat4::Translation({0.034f, 0.0f, 0.004f});
+}
+
+/** Where finger @p f leaves the palm, fanned out a little from the middle. */
+Mat4 finger_root(const Mat4& palm, int f)
+{
+    return palm * Mat4::Translation({-0.002f, k_finger_y[f], -0.042f}) * Mat4::RotationX(k_finger_y[f] * k_finger_splay);
+}
+
 /** Tip of the Keeper's index finger, following draw_keeper_hand(). */
 Vec3 index_fingertip(const Hand& hand)
 {
-    const float segment_len[3] = { 0.040f, 0.026f, 0.020f };
-    const float joint_bend[3] = { 1.25f, 1.45f, 1.0f };
-    constexpr float k_rest_curl = 0.08f;
-    Mat4 m = Mat4::FromPose(hand.aim_tracked ? hand.aim_rot : hand.rot, hand.pos)
-           * Mat4::Translation({0.034f, 0.0f, 0.004f}) * Mat4::Translation({-0.002f, 0.027f, -0.042f});
+    Mat4 m = finger_root(hand_palm_frame(hand), 0);
+    const float curl = hand.trigger * (1.0f - s.point_pose);
     for (int j = 0; j < 3; j++)
-        m = m * Mat4::RotationY(joint_bend[j] * hand.trigger * (1.0f - s.point_pose) + k_rest_curl) * Mat4::Translation({0.0f, 0.0f, -segment_len[j] * 0.95f});
+        m = m * Mat4::RotationY(k_joint_bend[j] * curl + k_rest_curl) * Mat4::Translation({0.0f, 0.0f, -k_segment_len[j] * k_finger_len[0]});
     return { m.m[12], m.m[13], m.m[14] };
 }
 
@@ -3028,72 +3073,121 @@ void draw_lit_box(const Mat4& view_proj, const Mat4& model, float r, float g, fl
     glDrawArrays(GL_TRIANGLES, 0, 36);
 }
 
-/** The Keeper's hand, built from boxes at the controller's grip position.
- *  It is turned like the aim pose (the laser): -Z forward along the
- *  controller, +Y up, and for the right hand the palm faces -X. The grip
- *  pose's own axes do not follow the controller that way on every runtime.
- *  The index finger curls with the trigger, the other fingers and thumb with
- *  the grip, so squeezing makes a fist. */
+/** One part of the hand: a run of the hand mesh posed by @p model. */
+void draw_hand_part(const Mat4& view_proj, const Mat4& model, const MeshRange& part, const float colour[3])
+{
+    const Mat4 mvp = view_proj * model;
+    glUniformMatrix4fv(s.loc_lit_mvp, 1, GL_FALSE, mvp.m);
+    glUniformMatrix4fv(s.loc_lit_model, 1, GL_FALSE, model.m);
+    glUniform4f(s.loc_lit_color, colour[0], colour[1], colour[2], 1.0f);
+    glDrawArrays(GL_TRIANGLES, part.first, part.count);
+}
+
+/** A model matrix from an origin and three (scaled) axes. */
+Mat4 basis_model(Vec3 origin, Vec3 x, Vec3 y, Vec3 z)
+{
+    Mat4 m = Mat4::Identity();
+    m.m[0] = x.x; m.m[1] = x.y; m.m[2] = x.z;
+    m.m[4] = y.x; m.m[5] = y.y; m.m[6] = y.z;
+    m.m[8] = z.x; m.m[9] = z.y; m.m[10] = z.z;
+    m.m[12] = origin.x; m.m[13] = origin.y; m.m[14] = origin.z;
+    return m;
+}
+
+Vec3 transform_point(const Mat4& m, Vec3 p)
+{
+    return { m.m[0] * p.x + m.m[4] * p.y + m.m[8] * p.z + m.m[12],
+             m.m[1] * p.x + m.m[5] * p.y + m.m[9] * p.z + m.m[13],
+             m.m[2] * p.x + m.m[6] * p.y + m.m[10] * p.z + m.m[14] };
+}
+
+Vec3 cross(Vec3 a, Vec3 b)
+{
+    return { a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x };
+}
+
+/** The Keeper's hand at the controller: a gaunt, grey-green hand with long
+ *  bony fingers, knobbly knuckles and hooked claws, coming out of a crimson
+ *  cuff. It is built from smooth parts (VRHandMesh) turned like the aim pose:
+ *  -Z forward along the controller, +Y up, and for the right hand the palm
+ *  faces -X. The index finger curls with the trigger, the other fingers and
+ *  thumb with the grip, so squeezing makes a fist. */
 void draw_keeper_hand(const Mat4& view_proj, const Hand& hand)
 {
-    // Pale, slightly sickly skin, dark claws, a crimson sleeve.
-    constexpr float skin[3]   = { 0.80f, 0.68f, 0.58f };
-    constexpr float claw[3]   = { 0.22f, 0.10f, 0.08f };
-    constexpr float sleeve[3] = { 0.45f, 0.08f, 0.10f };
+    constexpr float skin[3]     = { 0.56f, 0.60f, 0.48f };
+    constexpr float knuckle[3]  = { 0.67f, 0.69f, 0.57f };
+    constexpr float tendon[3]   = { 0.43f, 0.46f, 0.37f };
+    constexpr float claw[3]     = { 0.15f, 0.12f, 0.11f };
+    constexpr float cuff[3]     = { 0.40f, 0.11f, 0.10f };
+    constexpr float cuff_rim[3] = { 0.27f, 0.08f, 0.07f };
     // Pointing at a button (palm menu, menu screen): index straight, the rest curled.
     const float point = (&hand == &s.hands[1]) ? s.point_pose : 0.0f;
     const float index_curl = hand.trigger * (1.0f - point);
     const float fist_curl = std::fmax(hand.grip, point);
+    const HandMesh& mesh = s.hand_mesh;
 
     glUseProgram(s.lit_prog);
     const float light_len = std::sqrt(0.3f * 0.3f + 0.9f * 0.9f + 0.4f * 0.4f);
     glUniform3f(s.loc_lit_light, 0.3f / light_len, 0.9f / light_len, 0.4f / light_len);
-    glBindVertexArray(s.lit_cube_vao);
+    glBindVertexArray(s.hand_vao);
 
-    const Mat4 grip = Mat4::FromPose(hand.aim_tracked ? hand.aim_rot : hand.rot, hand.pos);
-    // Back of the hand sits just outside the controller handle.
-    const Mat4 palm = grip * Mat4::Translation({0.034f, 0.0f, 0.004f});
-    draw_lit_box(view_proj, palm * Mat4::Scale({0.022f, 0.074f, 0.084f}), skin[0], skin[1], skin[2]);
-    draw_lit_box(view_proj, palm * Mat4::Translation({0.002f, 0.0f, 0.062f}) * Mat4::Scale({0.034f, 0.064f, 0.05f}),
-                 sleeve[0], sleeve[1], sleeve[2]);
-
-    // Fingers, index on top (+Y) down to the little finger.
-    const float finger_y[4] = { 0.027f, 0.009f, -0.009f, -0.026f };
-    const float finger_len[4] = { 0.95f, 1.0f, 0.93f, 0.76f };
-    const float segment_len[3] = { 0.040f, 0.026f, 0.020f };
-    const float joint_bend[3] = { 1.25f, 1.45f, 1.0f };   // radians at a full curl
-    constexpr float k_rest_curl = 0.08f;                  // a relaxed, nearly straight hand
+    const Mat4 palm = hand_palm_frame(hand);
+    draw_hand_part(view_proj, palm, mesh.palm, skin);
+    // Fleshy pads on the palm side: the thumb's mound and the little finger's edge.
+    draw_hand_part(view_proj, palm * Mat4::Translation({-0.008f, 0.024f, 0.016f}) * Mat4::Scale({0.011f, 0.017f, 0.023f}), mesh.sphere, skin);
+    draw_hand_part(view_proj, palm * Mat4::Translation({-0.007f, -0.026f, 0.012f}) * Mat4::Scale({0.008f, 0.011f, 0.022f}), mesh.sphere, skin);
+    // Tendons fanning over the back of the hand, from the wrist to each finger.
+    const Vec3 palm_back = { palm.m[0], palm.m[1], palm.m[2] };  // +X: out of the back of the hand
     for (int f = 0; f < 4; f++)
     {
-        const float curl = (f == 0) ? index_curl : fist_curl;
-        Mat4 m = palm * Mat4::Translation({-0.002f, finger_y[f], -0.042f});
-        for (int j = 0; j < 3; j++)
-        {
-            const float len = segment_len[j] * finger_len[f];
-            m = m * Mat4::RotationY(joint_bend[j] * curl + k_rest_curl);
-            const float width = 0.017f - 0.002f * (float)j;
-            draw_lit_box(view_proj, m * Mat4::Translation({0.0f, 0.0f, -len * 0.5f}) * Mat4::Scale({width, width, len}),
-                         skin[0], skin[1], skin[2]);
-            m = m * Mat4::Translation({0.0f, 0.0f, -len});
-        }
-        // A short claw past the fingertip, bending on towards the palm.
-        const Mat4 tip = m * Mat4::RotationY(0.5f);
-        draw_lit_box(view_proj, tip * Mat4::Translation({0.0f, 0.0f, -0.006f}) * Mat4::Scale({0.008f, 0.01f, 0.014f}),
-                     claw[0], claw[1], claw[2]);
+        const Vec3 a = transform_point(palm, {0.0105f, k_finger_y[f] * 0.55f, 0.030f});
+        const Vec3 b = transform_point(palm, {0.0095f, k_finger_y[f], -0.036f});
+        const float len = Length(b - a);
+        const Vec3 along = (b - a) * (1.0f / len);
+        Vec3 side = cross(palm_back, along);
+        side = side * (1.0f / std::fmax(Length(side), 1e-6f));
+        const Vec3 out = cross(along, side);
+        constexpr float r = 0.0032f;
+        // The tube runs down its -Z, so its Z axis points back up the tendon.
+        draw_hand_part(view_proj, basis_model(a, out * r, side * r, along * -len), mesh.tube, tendon);
     }
+    // The cuff: a round sleeve end flaring towards the arm, with a dark rim.
+    draw_hand_part(view_proj, palm * Mat4::Translation({0.002f, 0.0f, 0.086f}) * Mat4::Scale({0.025f, 0.033f, 0.042f}), mesh.tube, cuff);
+    draw_hand_part(view_proj, palm * Mat4::Translation({0.002f, 0.0f, 0.087f}) * Mat4::Scale({0.026f, 0.036f, 0.008f}), mesh.sphere, cuff_rim);
 
-    // Thumb: from the top of the palm, along the controller's face.
-    Mat4 thumb = palm * Mat4::Translation({-0.010f, 0.038f, -0.006f})
-               * Mat4::RotationY(0.45f + 0.55f * fist_curl) * Mat4::RotationX(0.25f);
-    const float thumb_len[2] = { 0.032f, 0.026f };
-    for (int j = 0; j < 2; j++)
+    // A finger or the thumb: bones with a knuckle at each joint, a rounded tip
+    // and a claw hooking on past it, towards the palm.
+    auto draw_digit = [&](Mat4 m, int segments, const float* lengths, const float* radii, float thick,
+                          const float* bends, float curl, float rest, bool bend_after) {
+        for (int j = 0; j < segments; j++)
+        {
+            if (!bend_after)
+                m = m * Mat4::RotationY(bends[j] * curl + rest);
+            const float r = radii[j] * thick;
+            draw_hand_part(view_proj, m * Mat4::Scale({r * 1.12f, r * 1.12f, r * 1.12f}), mesh.sphere, knuckle);
+            draw_hand_part(view_proj, m * Mat4::Scale({r, r, lengths[j]}), mesh.tube, skin);
+            m = m * Mat4::Translation({0.0f, 0.0f, -lengths[j]});
+            if (bend_after)
+                m = m * Mat4::RotationY(bends[j] * curl + rest);
+        }
+        const float r_tip = radii[segments - 1] * thick * k_tube_taper;
+        draw_hand_part(view_proj, m * Mat4::Scale({r_tip, r_tip, r_tip}), mesh.sphere, skin);
+        const Mat4 hook = m * Mat4::RotationY(0.5f);
+        draw_hand_part(view_proj, hook * Mat4::Scale({r_tip * 0.75f, r_tip * 0.75f, r_tip * 3.9f}), mesh.cone, claw);
+    };
+    for (int f = 0; f < 4; f++)
     {
-        draw_lit_box(view_proj, thumb * Mat4::Translation({0.0f, 0.0f, -thumb_len[j] * 0.5f}) * Mat4::Scale({0.019f, 0.019f, thumb_len[j]}),
-                     skin[0], skin[1], skin[2]);
-        thumb = thumb * Mat4::Translation({0.0f, 0.0f, -thumb_len[j]}) * Mat4::RotationY(0.35f * fist_curl + 0.1f);
+        const float lengths[3] = { k_segment_len[0] * k_finger_len[f], k_segment_len[1] * k_finger_len[f], k_segment_len[2] * k_finger_len[f] };
+        draw_digit(finger_root(palm, f), 3, lengths, k_segment_radius, k_finger_thick[f], k_joint_bend,
+                   (f == 0) ? index_curl : fist_curl, k_rest_curl, false);
     }
-    draw_lit_box(view_proj, thumb * Mat4::Translation({0.0f, 0.0f, -0.006f}) * Mat4::Scale({0.009f, 0.011f, 0.013f}),
-                 claw[0], claw[1], claw[2]);
+    // Thumb: from its mound at the top of the palm, along the controller's face.
+    const Mat4 thumb = palm * Mat4::Translation({-0.010f, 0.034f, 0.002f})
+                     * Mat4::RotationY(0.45f + 0.55f * fist_curl) * Mat4::RotationX(0.25f);
+    const float thumb_len[2] = { 0.034f, 0.029f };
+    const float thumb_radius[2] = { 0.0088f, 0.0076f };
+    const float thumb_bend[2] = { 0.35f, 0.35f };
+    draw_digit(thumb, 2, thumb_len, thumb_radius, 1.0f, thumb_bend, fist_curl, 0.1f, true);
 
     glBindVertexArray(0);
 }
