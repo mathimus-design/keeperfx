@@ -454,7 +454,9 @@ struct State {
     XrAction turn_action = XR_NULL_HANDLE;      // right thumbstick
     XrAction haptic_action = XR_NULL_HANDLE;    // controller vibration, per hand
     XrAction pause_action = XR_NULL_HANDLE;     // left menu button
+    XrAction fight_action = XR_NULL_HANDLE;     // left X (Index: left A): go to the latest fight
     float turn_x = 0;                           // its sideways deflection
+    float turn_y = 0;                           // ... and forward / back (zooms the table)
     Vec3 head_forward = {0, 0, -1};             // horizontal, from the last rendered frame
     // Possession: life size, with the creature's eyes where the player's head
     // was when it began, turned so the creature faced the way the player did.
@@ -674,6 +676,11 @@ bool s_level_decided = false;
 bool s_finish_request = false;
 /** The "back to the hand" button was pressed (render -> game). */
 bool s_cancel_request = false;
+/** Go to the latest fight: asked (render -> game) and where it is (game ->
+ *  render; serial bumps for each answer, valid false when there was none). */
+bool s_fight_request = false;
+struct FightTarget { int serial = 0; bool valid = false; float x = 0, y = 0; };
+FightTarget s_fight_target;
 /** A pressed on a menu screen (render -> game), and until when the game
  *  thread's copy counts, so a stale press does not confirm a later name. */
 bool s_enter_request = false;
@@ -1096,7 +1103,8 @@ bool create_actions()
         !make_action(XR_ACTION_TYPE_VECTOR2F_INPUT, "scroll", "Scroll the dungeon", false, &s.scroll_action) ||
         !make_action(XR_ACTION_TYPE_VECTOR2F_INPUT, "turn", "Turn (possessing)", false, &s.turn_action) ||
         !make_action(XR_ACTION_TYPE_VIBRATION_OUTPUT, "haptic", "Feedback buzz", true, &s.haptic_action) ||
-        !make_action(XR_ACTION_TYPE_BOOLEAN_INPUT, "pause", "Pause the game", false, &s.pause_action))
+        !make_action(XR_ACTION_TYPE_BOOLEAN_INPUT, "pause", "Pause the game", false, &s.pause_action) ||
+        !make_action(XR_ACTION_TYPE_BOOLEAN_INPUT, "go_to_fight", "Go to the latest fight", false, &s.fight_action))
         return false;
 
     const char* const profiles[] = {
@@ -1105,10 +1113,15 @@ bool create_actions()
     };
     // Pause: the left menu button and Y on Touch controllers (SteamVR keeps the
     // menu button for its dashboard, so Y always works); Index ones have no
-    // menu button, so their left B and A. Paths differ per controller.
+    // menu button, so their left B. Go to the latest fight: left X on Touch,
+    // left A on Index. Paths differ per controller.
     const char* const pause_paths[][2] = {
         { "/user/hand/left/input/menu/click", "/user/hand/left/input/y/click" },
-        { "/user/hand/left/input/b/click",    "/user/hand/left/input/a/click" },
+        { "/user/hand/left/input/b/click",    nullptr },
+    };
+    const char* const fight_paths[] = {
+        "/user/hand/left/input/x/click",
+        "/user/hand/left/input/a/click",
     };
     // Grip: the Index's squeeze value follows the fingers resting on the grip,
     // so just holding the controller reads as gripping; its force sensor needs
@@ -1120,9 +1133,9 @@ bool create_actions()
     for (size_t p = 0; p < sizeof(profiles) / sizeof(profiles[0]); p++)
     {
         const char* const profile = profiles[p];
-        const XrActionSuggestedBinding bindings[] = {
+        std::vector<XrActionSuggestedBinding> bindings = {
             {s.pause_action,    to_path(pause_paths[p][0])},
-            {s.pause_action,    to_path(pause_paths[p][1])},
+            {s.fight_action,    to_path(fight_paths[p])},
             {s.pose_action,     to_path("/user/hand/left/input/grip/pose")},
             {s.pose_action,     to_path("/user/hand/right/input/grip/pose")},
             {s.grip_action,     to_path(grip_paths[p][0])},
@@ -1142,8 +1155,10 @@ bool create_actions()
         };
         XrInteractionProfileSuggestedBinding suggested = {XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
         suggested.interactionProfile = to_path(profile);
-        suggested.suggestedBindings = bindings;
-        suggested.countSuggestedBindings = (uint32_t)(sizeof(bindings) / sizeof(bindings[0]));
+        if (pause_paths[p][1] != nullptr)
+            bindings.push_back({s.pause_action, to_path(pause_paths[p][1])});
+        suggested.suggestedBindings = bindings.data();
+        suggested.countSuggestedBindings = (uint32_t)bindings.size();
         xr_ok(xrSuggestInteractionProfileBindings(s.instance, &suggested), profile);
     }
 
@@ -1274,8 +1289,8 @@ void destroy_xr()
     s.action_set = XR_NULL_HANDLE;
     s.pose_action = s.grip_action = s.recenter_action = s.laser_toggle_action = XR_NULL_HANDLE;
     s.aim_action = s.select_action = s.hand_action = s.panel_toggle_action = XR_NULL_HANDLE;
-    s.scroll_action = s.turn_action = s.haptic_action = s.pause_action = XR_NULL_HANDLE;
-    s.scroll_x = s.scroll_y = s.turn_x = 0.0f;
+    s.scroll_action = s.turn_action = s.haptic_action = s.pause_action = s.fight_action = XR_NULL_HANDLE;
+    s.scroll_x = s.scroll_y = s.turn_x = s.turn_y = 0.0f;
     s.hand_spaces[0] = s.hand_spaces[1] = XR_NULL_HANDLE;
     s.aim_spaces[0] = s.aim_spaces[1] = XR_NULL_HANDLE;
     for (Hand& hand : s.hands)
@@ -2765,13 +2780,69 @@ void update_table_turn(float dt)
     constexpr float k_deadzone = 0.2f;
     constexpr float k_turn_speed = 1.6f;  // radians per second at full deflection
     const float mag = std::fabs(s.turn_x);
-    if (s.grab_mask != 0 || mag <= k_deadzone || dt <= 0.0f)
+    // Mostly sideways turns; mostly forward / back zooms (update_table_zoom()).
+    if (s.grab_mask != 0 || mag <= k_deadzone || mag < std::fabs(s.turn_y) || dt <= 0.0f)
         return;
     const float eased = (mag - k_deadzone) / (1.0f - k_deadzone);
     const float delta = (s.turn_x > 0.0f ? 1.0f : -1.0f) * eased * eased * k_turn_speed * dt;
     const Vec3 pivot = s.last_head + s.head_forward * 0.5f;
     s.table_pos = pivot + RotateY(s.table_pos - pivot, delta);
     s.table_yaw += delta;
+}
+
+Vec3 game_to_stage(Vec3 g);
+
+/** Go to the latest fight: once the game thread has found it, the table
+ *  glides (easing out, in about half a second) so that spot comes to rest in
+ *  front of the player, at reaching distance; a short buzz says so, a weak
+ *  one if there was nothing to go to. */
+void update_fight_jump(float dt)
+{
+    static int seen_serial = 0;
+    static Vec3 remaining = {0, 0, 0};
+    if (s_fight_target.serial != seen_serial)
+    {
+        seen_serial = s_fight_target.serial;
+        if (s_fight_target.valid && !s.possessing)
+        {
+            const Vec3 spot = game_to_stage({s_fight_target.x, s_fight_target.y, 0.0f});
+            Vec3 want = s.last_head + s.head_forward * 0.45f;
+            remaining = want - spot;
+            remaining.y = 0.0f;  // the table keeps its height
+            buzz(0, 0.6f, 0.08f);
+        }
+        else
+        {
+            remaining = {0, 0, 0};
+            buzz(0, 0.25f, 0.04f);
+        }
+    }
+    if (s.grab_mask != 0 || dt <= 0.0f || Length(remaining) < 1e-4f)
+        return;
+    const float step = std::fmin(1.0f, dt * 8.0f);  // eases out
+    const Vec3 move = remaining * step;
+    s.table_pos = s.table_pos + move;
+    remaining = remaining - move;
+}
+
+/** Right thumbstick forward / back at the table: zooms in / out about the
+ *  spot half a metre in front of the head, at the table's height, so what is
+ *  in front stays put and the table neither rises nor sinks. */
+void update_table_zoom(float dt)
+{
+    constexpr float k_deadzone = 0.2f;
+    constexpr float k_zoom_speed = 1.2f;  // e-folds per second at full deflection
+    const float mag = std::fabs(s.turn_y);
+    if (s.grab_mask != 0 || mag <= k_deadzone || mag <= std::fabs(s.turn_x) || dt <= 0.0f)
+        return;
+    const float eased = (mag - k_deadzone) / (1.0f - k_deadzone);
+    float scale = s.table_scale * std::exp((s.turn_y > 0.0f ? 1.0f : -1.0f) * eased * eased * k_zoom_speed * dt);
+    if (scale < k_min_scale) scale = k_min_scale;
+    if (scale > k_max_scale) scale = k_max_scale;
+    Vec3 pivot = s.last_head + s.head_forward * 0.5f;
+    pivot.y = s.table_pos.y;
+    s.table_pos = pivot - (pivot - s.table_pos) * (scale / s.table_scale);
+    s.table_scale = scale;
 }
 
 void update_input(XrTime time, float dt)
@@ -2870,6 +2941,14 @@ void update_input(XrTime time, float dt)
         buzz(0, 0.5f, 0.05f);
     }
 
+    get.action = s.fight_action;
+    XrActionStateBoolean fight = {XR_TYPE_ACTION_STATE_BOOLEAN};
+    if (XR_SUCCEEDED(xrGetActionStateBoolean(s.session, &get, &fight)) &&
+        fight.isActive && fight.changedSinceLastSync && fight.currentState && s.in_level && !s.possessing)
+    {
+        s_fight_request = true;  // answered by the game thread with s_fight_target
+    }
+
     get.action = s.scroll_action;
     XrActionStateVector2f stick = {XR_TYPE_ACTION_STATE_VECTOR2F};
     if (XR_SUCCEEDED(xrGetActionStateVector2f(s.session, &get, &stick)) && stick.isActive)
@@ -2880,7 +2959,10 @@ void update_input(XrTime time, float dt)
     get.action = s.turn_action;
     XrActionStateVector2f turn = {XR_TYPE_ACTION_STATE_VECTOR2F};
     if (XR_SUCCEEDED(xrGetActionStateVector2f(s.session, &get, &turn)) && turn.isActive)
+    {
         s.turn_x = turn.currentState.x;
+        s.turn_y = turn.currentState.y;
+    }
 
     // While possessing, the left stick walks the creature (see
     // update_possession()), the right one turns, and the table stays where it
@@ -2894,6 +2976,8 @@ void update_input(XrTime time, float dt)
         update_table_grab();
         update_table_scroll(dt);
         update_table_turn(dt);
+        update_table_zoom(dt);
+        update_fight_jump(dt);
     }
 }
 
@@ -4077,6 +4161,14 @@ void GameThreadSync()
         {
             s_finish_request = false;
             s_finish_pending = true;  // taken by VR_ConsumeFinishRequest()
+        }
+        if (s_fight_request)
+        {
+            s_fight_request = false;
+            FightTarget answer;
+            answer.serial = s_fight_target.serial + 1;
+            answer.valid = FindLatestFight(&answer.x, &answer.y);
+            s_fight_target = answer;
         }
         if (s_cancel_request)
         {

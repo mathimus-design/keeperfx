@@ -47,6 +47,7 @@
 #include "engine_arrays.h"     // floor_height_table[]
 #include <cmath>
 #include <unordered_set>
+#include <unordered_map>
 #include "post_inc.h"
 
 /* engine_render.c; not in a header. */
@@ -62,6 +63,48 @@ namespace {
 
 /** Sprite ids whose images the render thread already has. */
 std::unordered_set<int32_t> s_sent_images;
+/** For GUI sprites (keyed by where they sit in memory): a fingerprint of the
+ *  image each id was sent with. The game reloads its GUI sprites (between
+ *  levels, for one), and a different image can then sit at the same address;
+ *  a changed fingerprint sends the new image under the same id. */
+std::unordered_map<int32_t, uint32_t> s_gui_fingerprints;
+
+/** FNV-1a over a GUI sprite's size and RLE data (walked row by row, as
+ *  decode_sprite() reads it, so it never reads past the image). */
+uint32_t gui_sprite_fingerprint(const struct TbSprite* spr)
+{
+    uint32_t h = 2166136261u;
+    auto mix = [&](uint8_t b) { h = (h ^ b) * 16777619u; };
+    mix((uint8_t)spr->SWidth); mix((uint8_t)(spr->SWidth >> 8));
+    mix((uint8_t)spr->SHeight); mix((uint8_t)(spr->SHeight >> 8));
+    const signed char* sp = (const signed char*)spr->Data;
+    const signed char* sp_end = sp + (ptrdiff_t)spr->SWidth * spr->SHeight * 3 + spr->SHeight;
+    for (int y = 0; y < spr->SHeight && sp < sp_end; y++)
+    {
+        while (sp < sp_end)
+        {
+            const signed char cmd = *sp++;
+            mix((uint8_t)cmd);
+            if (cmd == 0)
+                break;
+            if (cmd > 0)
+                for (int i = 0; i < cmd && sp < sp_end; i++)
+                    mix((uint8_t)*sp++);
+        }
+    }
+    return h;
+}
+
+/** True once per GUI sprite image the render thread does not have yet. */
+bool gui_sprite_needs_sending(int32_t id, const struct TbSprite* spr)
+{
+    const uint32_t print = gui_sprite_fingerprint(spr);
+    auto it = s_gui_fingerprints.find(id);
+    if (it != s_gui_fingerprints.end() && it->second == print)
+        return false;
+    s_gui_fingerprints[id] = print;
+    return true;
+}
 
 /** Decodes TbSprite RLE: negative = transparent skip, positive = run of
  *  palette indices, 0 = end of row. Same format decode_keeper_rle() reads. */
@@ -132,7 +175,7 @@ void add_status_layer(ThingSnapshot& snap, const struct TbSprite* spr, float x, 
     if (spr == nullptr || spr->Data == nullptr || spr->SWidth == 0 || spr->SHeight == 0)
         return;
     const int32_t id = gui_sprite_id(spr);
-    if (s_sent_images.insert(id).second)
+    if (gui_sprite_needs_sending(id, spr))
     {
         SpriteImage img;
         img.id = id;
@@ -599,7 +642,7 @@ int32_t request_gui_sprite(ThingSnapshot& snap, const struct TbSprite* spr)
     if (spr == nullptr || spr->Data == nullptr || spr->SWidth == 0 || spr->SHeight == 0)
         return 0;
     const int32_t id = gui_sprite_id(spr);
-    if (s_sent_images.insert(id).second)
+    if (gui_sprite_needs_sending(id, spr))
     {
         SpriteImage img;
         img.id = id;
@@ -677,6 +720,7 @@ void UpdateThingSnapshot(ThingSnapshot& snap)
     if (snap.reset_cache)
     {
         s_sent_images.clear();
+        s_gui_fingerprints.clear();
         snap.new_images.clear();
         snap.reset_cache = false;
     }

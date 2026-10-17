@@ -23,6 +23,10 @@
 #include "config_players.h"  // get_player_state_stats(), PsPg_Spell, PSt_*
 #include "packets.h"         // set_players_packet_action(), PckA_SetPlyrState
 #include "bflib_keybrd.h"    // lbKeyOn[], KC_ESCAPE
+#include "creature_battle.h" // active_battle_exists(), creature_battle_get(), step_battles_forward()
+#include "map_events.h"      // struct Event, EvKind_*
+#include "dungeon_data.h"    // get_my_dungeon(), visible_battles, event_button_index
+#include "local_camera.h"    // move_local_camera_to_position()
 #include "post_inc.h"
 
 namespace VR {
@@ -199,6 +203,64 @@ bool PlainHand()
 {
     struct PlayerInfo* player = get_my_player();
     return player != nullptr && player->work_state == PSt_CtrlDungeon;
+}
+
+bool FindLatestFight(float* x, float* y)
+{
+    struct PlayerInfo* player = get_my_player();
+    struct Dungeon* dungeon = get_my_dungeon();
+    if (player == nullptr || dungeon_invalid(dungeon))
+        return false;
+    bool found = false;
+    if (active_battle_exists(player->id_number))
+    {
+        struct CreatureBattle* battle = creature_battle_get(dungeon->visible_battles[0]);
+        struct Thing* thing = (battle != nullptr) ? thing_get(battle->first_creatr) : nullptr;
+        if (thing_exists(thing))
+        {
+            *x = (float)thing->mappos.x.val;
+            *y = (float)thing->mappos.y.val;
+            found = true;
+        }
+        step_battles_forward(player->id_number);
+    }
+    if (!found)
+    {
+        // The newest alert button of a dangerous kind (later buttons are newer).
+        for (int i = EVENT_BUTTONS_COUNT; i >= 0 && !found; i--)
+        {
+            const int idx = dungeon->event_button_index[i];
+            if (idx <= 0 || idx >= EVENTS_COUNT)
+                continue;
+            const struct Event* event = &game.event[idx];
+            if ((event->flags & EvF_Exists) == 0)
+                continue;
+            switch (event->kind)
+            {
+            case EvKind_HeartAttacked: case EvKind_EnemyFight: case EvKind_Breach:
+            case EvKind_RoomUnderAttack: case EvKind_AlarmTriggered: case EvKind_FriendlyFight:
+            case EvKind_EnemyDoor: case EvKind_RoomTakenOver: case EvKind_RoomLost:
+                if (event->mappos_x > 0 || event->mappos_y > 0)
+                {
+                    *x = (float)event->mappos_x;
+                    *y = (float)event->mappos_y;
+                    found = true;
+                }
+                break;
+            default:
+                break;
+            }
+        }
+    }
+    if (!found && (dungeon->last_combat_location.x.val > 0 || dungeon->last_combat_location.y.val > 0))
+    {
+        *x = (float)dungeon->last_combat_location.x.val;
+        *y = (float)dungeon->last_combat_location.y.val;
+        found = true;
+    }
+    if (found)
+        move_local_camera_to_position((MapCoord)*x, (MapCoord)*y);  // the PC view follows
+    return found;
 }
 
 bool InFrontendMenus()

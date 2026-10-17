@@ -75,6 +75,11 @@ bool PlainHand();
 
 /** Game thread: true once the level is won or lost (waiting to continue). */
 bool LevelDecided();
+/** Where to look for trouble: the next of your battles (each call steps on
+ *  to the next one, as the game's "zoom to fight" key does), else the most
+ *  recent attack / breach / intruder alert, else the last fight seen.
+ *  Game units; false when there is nothing. Also moves the PC camera there. */
+bool FindLatestFight(float* x, float* y);
 /** The game is in its own menus (main menu, level map, level stats...), not a level. */
 bool InFrontendMenus();
 /** Holds Escape down (or lets it go) for the frontend's back handling. */
