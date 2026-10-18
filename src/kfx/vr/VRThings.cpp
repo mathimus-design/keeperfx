@@ -165,7 +165,16 @@ bool should_draw(const struct Thing* thing, const struct PlayerInfo* player)
  *  their own id range, keyed by the sprite (they stay loaded for the level). */
 int32_t gui_sprite_id(const struct TbSprite* spr)
 {
-    return (int32_t)(0x40000000u | (uint32_t)(((uintptr_t)spr >> 3) & 0x3FFFFFFFu));
+    // One id per sprite entry, handed out in turn. (Ids made from the address
+    // collided: the entries are only 6 bytes apart, so neighbours such as the
+    // digits 1 and 2 could share an id and show each other's image.)
+    static std::unordered_map<const struct TbSprite*, int32_t> ids;
+    auto it = ids.find(spr);
+    if (it != ids.end())
+        return it->second;
+    const int32_t id = (int32_t)(0x40000000u + (uint32_t)ids.size());
+    ids.emplace(spr, id);
+    return id;
 }
 
 /** Adds an upright, full-brightness GUI sprite above a creature. */
